@@ -10,5 +10,5 @@ window.PB_AUTH = {
 };
 
 window.PB_CLOUD = {
-  url: '' // ← 貼上網頁應用程式網址，例如 'https://script.google.com/macros/s/……/exec'
+  url: 'https://script.google.com/macros/s/AKfycbzCOwS0UJJcZB2ljNRkuMYBOeHtJ8T4Q3QgWe38hQK_7tOkHe0VNMFQm_i166a_35T1Zw/exec'
 };
