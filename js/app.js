@@ -1,8 +1,8 @@
 /*
  * 採購工作看板：畫面程式
  * ---------------------------------------------------------------
- * 分頁：#orders 叫貨進度｜#approvals 簽核｜#vendors 廠商產品查詢｜#users 人員與權限（只有管理員）
- * 資料：PBStore（js/cloud-store.js）的 orders、vendors、products，會同步給所有人
+ * 分頁：#orders 叫貨進度｜#daily 每日工作｜#approvals 簽核｜#vendors 廠商產品查詢｜#users 人員與權限（只有管理員）
+ * 資料：PBStore（js/cloud-store.js）的 orders、vendors、products、tasks、people、daily，會同步給所有人
  * 權限：PBAuth.can(代號)，管理員全部都有。代號見 PERMS。這是畫面權限，雲端後端只擋「不在名單的人」。
  *
  * 叫貨單欄位：{ id, no, date, item, spec, qty, unit, vendorId, vendorName, price, amount, needBy, requester, note,
@@ -11,6 +11,11 @@
  *   history: [{ id, act, by, role, at, note, to, add }], sample?, updatedAt }
  * 廠商：{ id, name, category, contact, phone, email, terms, leadDays, note, sample? }
  * 產品：{ id, vendorId, name, spec, category, unit, price, moq, leadDays, note, sample? }
+ * 每日工作項目 tasks：{ id, title, note, days: [0-6，空=每天], who: null(所有人) | [email], order, start, end(停用後的最後一天), createdAt, updatedAt }
+ * 人員名冊 people：{ id: email, email, name, seenAt, off?(不做每日工作), createdAt, updatedAt }，登入時自動建立
+ * 每日紀錄 daily：{ id: 日期|email, date, email, name, checks: { 項目id: { at, t: 項目名稱 } }, extras: [{ id, title, done, at }],
+ *   note, doneAt(自己確認), due: [{ id, t, n }](確認當下的清單), confirmAt, confirmBy, confirmNote(主管確認),
+ *   returnNote, returnBy(主管退回), log: [{ id, act, by, at, note }], updatedAt }
  */
 (function () {
 'use strict';
@@ -51,6 +56,7 @@ const PERMS = [
   { id: 'approve1', label: '主管簽核', desc: '第一關：核准或退回送簽的叫貨單' },
   { id: 'approve2', label: '經理核准', desc: '第二關：核准後才能叫貨' },
   { id: 'vendor', label: '廠商產品維護', desc: '新增、修改廠商與產品報價，從 Excel 匯入' },
+  { id: 'task', label: '每日工作管理', desc: '設定每日工作項目、查看全員打勾進度，做主管確認或退回（每個人自己的打勾不需要權限）' },
 ];
 const PERM_LABEL = Object.fromEntries(PERMS.map(p => [p.id, p.label]));
 
@@ -59,9 +65,12 @@ const D = {
   orders: () => PBStore.list('orders'),
   vendors: () => PBStore.list('vendors'),
   products: () => PBStore.list('products'),
+  tasks: () => PBStore.list('tasks'),
+  people: () => PBStore.list('people'),
+  daily: () => PBStore.list('daily'),
 };
 let vById = new Map();
-const S = { view: 'orders', day: today(), scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
+const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
 const can = p => !!(window.PBAuth && PBAuth.can(p));
 const isAdmin = () => !!(window.PBAuth && PBAuth.isAdmin());
 const myName = () => (window.PBAuth && (PBAuth.name() || PBAuth.email())) || '';
@@ -80,10 +89,11 @@ function histAdd(o, entry) { return [...(o.history || []), { id: rid(), by: myNa
 // 用 setTimeout 合併多次更新（不用 requestAnimationFrame：App 在背景時它會暫停，切回來前畫面不會更新）
 let rq = 0;
 function scheduleRender() { if (rq) return; rq = setTimeout(() => { rq = 0; render(); }, 16); }
-function onData() { vById = new Map(D.vendors().map(v => [v.id, v])); scheduleRender(); }
+function onData() { vById = new Map(D.vendors().map(v => [v.id, v])); dIdx = null; scheduleRender(); }
 function render() {
   renderChrome();
   if (S.view === 'orders') renderOrders();
+  else if (S.view === 'daily') renderDaily();
   else if (S.view === 'approvals') renderApprovals();
   else if (S.view === 'vendors') renderVendors();
   else renderUsers();
@@ -92,10 +102,15 @@ function render() {
     const typing = a && dlg.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
     if (!typing) dlg.innerHTML = detailHtml(S.detailId);
   }
+  if (dlg.open && S.dperson) {
+    const a = document.activeElement;
+    const typing = a && dlg.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+    if (!typing) dlg.innerHTML = personDayHtml(S.dpday, S.dperson);
+  }
 }
 function route() {
   const h = location.hash.slice(1);
-  let v = ['orders', 'approvals', 'vendors', 'users'].includes(h) ? h : 'orders';
+  let v = ['orders', 'daily', 'approvals', 'vendors', 'users'].includes(h) ? h : 'orders';
   if (v === 'users' && !isAdmin()) v = 'orders';
   S.view = v;
   $$('main > .view').forEach(s => { s.hidden = s.id !== 'view-' + S.view; });
@@ -129,13 +144,17 @@ function renderBanner() {
   else if (st.state === 'offline') b.push(`<div class="banner warn">${esc(st.detail || '目前離線')}。修改會先存在這台裝置，恢復網路後自動上傳。</div>`);
   const n = sampleCount();
   if (n && isAdmin()) b.push(`<div class="banner">目前有 ${n} 筆範例資料（標有「範例」）。開始正式使用前請清除。<button class="btn sm" type="button" data-act="clear-sample" data-confirm="確定清除全部範例？">清除範例資料</button></div>`);
-  if (window.PBAuth && PBAuth.user() && !isAdmin() && !PERMS.some(p => can(p.id))) b.push(`<div class="banner">你目前只能查看。需要新增叫貨或簽核的話，請找管理員開權限。</div>`);
+  if (window.PBAuth && PBAuth.user() && !isAdmin() && !PERMS.some(p => can(p.id))) b.push(`<div class="banner">你目前只能查看叫貨資料（每日工作可以正常打勾）。需要新增叫貨或簽核的話，請找管理員開權限。</div>`);
   const html = b.join('');
   if (html !== lastBanner) { $('#banner').innerHTML = html; lastBanner = html; }
 }
 function renderBadge() {
   const n = D.orders().filter(o => o.progress !== 'cancelled' && canApprove(o)).length;
   const el = $('#apprBadge'); el.hidden = !n; el.textContent = n;
+  // 每日工作：今天還沒打勾的項目數（確認後不顯示）
+  const info = myEmail() ? dayItems(today(), myEmail()) : { total: 0, done: 0 };
+  const left = info.rec && (info.rec.doneAt || info.rec.confirmAt) ? 0 : info.total - info.done;
+  const db = $('#dailyBadge'); db.hidden = !left; db.textContent = left;
 }
 const sampleCount = () => ['orders', 'vendors', 'products'].reduce((a, k) => a + D[k]().filter(x => x.sample).length, 0);
 const loaded = () => PBStore.status().loaded;
@@ -400,11 +419,491 @@ function renderVendors() {
   out.innerHTML = head + body;
 }
 
+/* ---------- 每日工作 ---------- */
+// 每個人每天的清單 = 符合「星期、指派對象、有效期間」的工作項目 + 自己加的臨時工作。
+// 打勾存在 daily 紀錄（一人一天一筆）；自己按「確認完成」後鎖定，主管再做「主管確認」或退回。
+const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0];
+const STATE_LABEL = { mgr: '主管已確認', self: '待主管確認', ready: '已全部打勾', doing: '進行中', todo: '未開始', none: '沒有工作' };
+const STATE_ORDER = { self: 0, ready: 1, doing: 2, todo: 3, mgr: 4, none: 5 };
+const PRESET_TASKS = [
+  ['確認今日請購需求', '查看各單位的請購單、訊息或 Email，整理成叫貨單'],
+  ['處理待簽核單據', '有簽核權限的人到「簽核」頁處理；申請人追蹤被退回的單'],
+  ['向廠商下單', '已核准的叫貨單向廠商下單，完成後按「標記已叫貨」'],
+  ['追蹤在途與逾期到貨', '逾期未到的打電話給廠商確認交期'],
+  ['到貨點收與登記', '核對數量和品質，在 App 登記到貨'],
+  ['更新廠商報價', '有新報價或價格異動時，更新到「廠商產品查詢」'],
+  ['整理明日叫貨清單', '下班前確認明天要叫的貨'],
+];
+const myEmail = () => String((window.PBAuth && PBAuth.email()) || '').toLowerCase();
+const canTask = () => can('task');
+const hm = iso => { const d = new Date(iso); return isNaN(d) ? '' : pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+const dailyId = (date, email) => date + '|' + email;
+let dIdx = null; // daily 紀錄索引（id -> 紀錄），資料變動時清掉
+function dayRec(date, email) {
+  if (!dIdx) dIdx = new Map(D.daily().map(r => [r.id, r]));
+  return dIdx.get(dailyId(date, email)) || null;
+}
+function personName(email, rec) {
+  const p = PBStore.get('people', email);
+  return (p && p.name) || (rec && rec.name) || email;
+}
+function daysText(days) {
+  const d = Array.isArray(days) ? days : [];
+  if (!d.length || d.length === 7) return '每天';
+  const s = WEEK_ORDER.filter(x => d.includes(x)).join(',');
+  if (s === '1,2,3,4,5') return '週一至週五';
+  if (s === '1,2,3,4,5,6') return '週一至週六';
+  return '週' + WEEK_ORDER.filter(x => d.includes(x)).map(x => WK[x]).join('、');
+}
+function whoText(t) {
+  if (!Array.isArray(t.who)) return '所有人';
+  if (!t.who.length) return '（沒有指派）';
+  const n = t.who.map(e => personName(e));
+  return n.length > 3 ? n.slice(0, 3).join('、') + ` 等 ${n.length} 人` : n.join('、');
+}
+const taskSort = (a, b) => (num(a.order) - num(b.order)) || cmpZh(a.title, b.title);
+function taskOn(t, date, email) {
+  if (t.start && date < t.start) return false;
+  if (t.end && date > t.end) return false;
+  const days = Array.isArray(t.days) ? t.days : [];
+  if (days.length && !days.includes(parseYmd(date).getDay())) return false;
+  if (Array.isArray(t.who)) return t.who.includes(email);
+  const p = PBStore.get('people', email);
+  return !(p && p.off); // 「所有人」不含設定為不做每日工作的人
+}
+// 確認過的日子用當時存下的清單（之後改項目也不影響紀錄），還沒確認的用目前的設定
+function dueFor(date, email, rec) {
+  if (rec && Array.isArray(rec.due)) return rec.due;
+  return D.tasks().filter(t => taskOn(t, date, email)).sort(taskSort).map(t => ({ id: t.id, t: t.title, n: t.note || '' }));
+}
+function dayItems(date, email) {
+  const rec = dayRec(date, email), due = dueFor(date, email, rec), checks = (rec && rec.checks) || {};
+  const items = due.map(x => ({ id: x.id, title: x.t, note: x.n, done: !!checks[x.id], at: checks[x.id] && checks[x.id].at, kind: 't' }));
+  // 打過勾、但已不在清單上的項目（例如後來被刪除）照樣列出，紀錄不會不見
+  for (const [id, c] of Object.entries(checks)) if (!due.some(x => x.id === id)) items.push({ id, title: (c && c.t) || '（已刪除的項目）', done: true, at: c && c.at, kind: 't' });
+  for (const x of (rec && rec.extras) || []) items.push({ id: x.id, title: x.title, note: '', done: !!x.done, at: x.at, kind: 'x' });
+  return { rec, items, total: items.length, done: items.filter(i => i.done).length };
+}
+function dayState(info) {
+  const r = info.rec;
+  if (r && r.confirmAt) return 'mgr';
+  if (r && r.doneAt) return 'self';
+  if (!info.total) return 'none';
+  if (!info.done) return 'todo';
+  return info.done >= info.total ? 'ready' : 'doing';
+}
+const pctOf = info => info.total ? Math.round(info.done / info.total * 100) : 0;
+const bar = info => `<span class="bar" aria-hidden="true"><i style="width:${pctOf(info)}%"></i></span>`;
+const doneAtText = (at, date) => !at ? '' : isoDay(at) === date ? hm(at) : stamp(at);
+
+// 修改某人某天的紀錄；fn 回傳 false 代表不儲存
+function dayNext(date, email, fn) {
+  const cur = dayRec(date, email) || { id: dailyId(date, email), date, email, name: email === myEmail() ? myName() : personName(email), checks: {}, extras: [], note: '', log: [] };
+  const next = JSON.parse(JSON.stringify(cur));
+  if (fn(next) === false) return null;
+  next.updatedAt = nowIso();
+  return next;
+}
+function saveDay(date, email, fn, msg) {
+  const next = dayNext(date, email, fn);
+  if (!next) return false;
+  PBStore.save('daily', next);
+  if (msg) toast(msg);
+  return true;
+}
+const logAdd = (r, act, note) => { r.log = [...(r.log || []), { id: rid(), act, by: myName(), at: nowIso(), ...(note ? { note } : {}) }]; };
+const lockedMsg = r => { if (r.confirmAt) { toast('主管已確認，不能再修改。'); return true; } if (r.doneAt) { toast('已確認完成的工作不能修改，請先按「取消確認」。'); return true; } return false; };
+
+// 登入的人自動加入人員名冊（每日工作的指派、團隊確認名單用）
+function ensureMe() {
+  const email = myEmail();
+  if (!email || !loaded()) return;
+  const p = PBStore.get('people', email), name = (window.PBAuth && PBAuth.name()) || email, t = today();
+  if (p && p.name === name && p.seenAt === t) return;
+  PBStore.save('people', { ...(p || { id: email, email, createdAt: nowIso() }), name, seenAt: t, updatedAt: nowIso() });
+}
+
+function renderDaily() {
+  const date = S.dday;
+  $('#dday').value = date;
+  $('#ddayinfo').textContent = (date === today() ? '今天 · ' : '') + wk(date);
+  $('#dtodayBtn').hidden = date === today();
+  if (!canTask() && S.dmode === 'team') S.dmode = 'me';
+  $('#dseg').hidden = !canTask();
+  $$('[data-dmode]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.dmode === S.dmode)));
+  $('#taskSetBtn').hidden = !canTask();
+  const root = $('#dailyBody');
+  if (!loaded() && !D.tasks().length && !D.daily().length) { root.innerHTML = loadingBox('每日工作'); return; }
+  keepInputs(root, () => { root.innerHTML = S.dmode === 'team' ? teamHtml(date) : myDayHtml(date); });
+}
+
+function boardHints() {
+  const live = D.orders().filter(o => o.progress !== 'cancelled'), h = [];
+  const ap = live.filter(canApprove).length;
+  if (ap) h.push(`<button type="button" class="hchip" data-go="approvals">待你簽核 ${ap} 筆</button>`);
+  if (can('order')) {
+    const to = live.filter(o => o.progress === 'todo' && o.approval === 'approved').length;
+    const ov = live.filter(isOverdue).length;
+    if (to) h.push(`<button type="button" class="hchip" data-goflag="toorder">已核准待叫貨 ${to} 筆</button>`);
+    if (ov) h.push(`<button type="button" class="hchip bad" data-goflag="overdue">逾期未到貨 ${ov} 筆</button>`);
+  }
+  return h.length ? `<div class="hintbar">看板上待處理：${h.join('')}</div>` : '';
+}
+
+function myDayHtml(date) {
+  const email = myEmail(), info = dayItems(date, email), r = info.rec, st = dayState(info);
+  const future = date > today(), locked = future || !!(r && (r.doneAt || r.confirmAt));
+  const noTasks = !D.tasks().some(t => !t.end || t.end >= today());
+  const setup = noTasks ? `<div class="empty"><h3>還沒有設定每日工作項目</h3>
+      <p>${canTask() ? '把每天固定要做的事設定成工作項目，之後每個人打開這裡就會看到自己的清單：做完打勾，下班前按「確認工作完成」，主管再到「團隊確認」確認。' : '請主管設定每日工作項目。設定好之後，你每天打開這裡就會看到自己的清單。'}</p>
+      ${canTask() ? '<div class="row"><button class="btn primary" type="button" data-dact="preset">套用建議的採購每日工作</button><button class="btn" type="button" data-dact="settings">自己設定工作項目</button></div><p class="small">建議項目可以再修改、停用，也可以只指派給特定的人。</p>' : ''}
+    </div>` : '';
+  const rows = info.items.map(i => checkRow(i, locked, date)).join('');
+  return `${setup}${date === today() ? boardHints() : ''}<div class="dsheet">
+    <div class="dhead">
+      <div class="dhead-t"><span class="chip ${st}">${STATE_LABEL[st]}</span><h2 class="h2">${esc(myName())} 的工作</h2></div>
+      <div class="dprog"><span class="k-val">${info.done}<small>/ ${info.total} 項完成</small></span>${bar(info)}</div>
+      ${r && r.confirmAt ? seal('確認', isoDay(r.confirmAt), 'lg') : ''}
+    </div>
+    ${r && r.returnNote && !r.doneAt ? `<div class="banner bad dret">主管退回：${esc(r.returnNote)}${r.returnBy ? `（${esc(r.returnBy)}）` : ''}。修改後再確認一次。</div>` : ''}
+    <ul class="checks">${rows || `<li class="empty-row">${future ? '這天還沒到，到了當天才能打勾。' : '這天沒有指派給你的工作項目。可以在下面加入臨時工作。'}</li>`}</ul>
+    ${locked ? '' : `<form class="addx" data-addx><input id="xtitle" maxlength="60" placeholder="新增臨時工作（只算這一天）" aria-label="臨時工作名稱" autocomplete="off" enterkeyhint="done"><button class="btn sm" type="submit">＋ 加入</button></form>`}
+    ${future ? '' : confirmBlock(date, info)}
+  </div>`;
+}
+function checkRow(i, locked, date) {
+  const id = esc(i.id);
+  return `<li class="ck${i.done ? ' done' : ''}">
+    <label>${locked ? `<span class="ckbox lg" role="img" aria-label="${i.done ? '已完成' : '未完成'}">${i.done ? '✓' : ''}</span>` : `<input type="checkbox" ${i.kind === 'x' ? 'data-xcheck' : 'data-check'}="${id}"${i.done ? ' checked' : ''}>`}
+      <span class="ck-t"><b>${esc(i.title)}</b>${i.kind === 'x' ? '<span class="tag-x">臨時</span>' : ''}${i.note ? `<small>${esc(i.note)}</small>` : ''}</span></label>
+    ${i.done && i.at ? `<time title="打勾時間">${esc(doneAtText(i.at, date))}</time>` : ''}
+    ${i.kind === 'x' && !locked ? `<button type="button" class="icon-btn sm" data-dact="xdel" data-id="${id}" aria-label="刪除 ${esc(i.title)}">×</button>` : ''}
+  </li>`;
+}
+function confirmBlock(date, info) {
+  const r = info.rec, left = info.total - info.done;
+  if (r && r.confirmAt) return `<div class="next ok"><h3>主管已確認 · ${esc(r.confirmBy || '')} ${esc(stamp(r.confirmAt))}</h3>${r.note ? `<p class="hint">你的備註：${esc(r.note)}</p>` : ''}${r.confirmNote ? `<p class="hint">主管意見：${esc(r.confirmNote)}</p>` : ''}</div>`;
+  if (r && r.doneAt) return `<div class="next"><h3>已確認完成 · ${esc(stamp(r.doneAt))}</h3>
+    <p class="hint">${left ? `有 ${left} 項未完成，已附上原因。` : '全部完成。'}等主管確認；要修改的話先取消確認。</p>${r.note ? `<p class="hint">備註：${esc(r.note)}</p>` : ''}
+    <div class="row"><button class="btn sm" type="button" data-dact="unconfirm">取消確認</button></div></div>`;
+  if (!info.total) return '';
+  const label = date === today() ? '確認今日工作完成' : `確認 ${md(date)} 工作完成`;
+  return `<div class="next"><h3>${left ? `還有 ${left} 項沒打勾` : '全部完成了，按下面的按鈕確認'}</h3>
+    <label class="f" for="dnote-me">工作備註${left ? '<span class="req">（有未完成的項目，請寫原因）</span>' : '（選填）'}<textarea id="dnote-me" rows="2" maxlength="300" placeholder="今天的狀況、未完成的原因、明天要接續的事">${esc((r && r.note) || '')}</textarea></label>
+    <div class="row"><button class="btn primary" type="button" data-dact="confirm">${label}</button></div></div>`;
+}
+
+function teamFor(date) {
+  const emails = new Set();
+  for (const p of D.people()) if (!p.off) emails.add(p.email || p.id);
+  for (const r of D.daily()) if (r.date === date) emails.add(r.email);
+  return [...emails].map(email => { const info = dayItems(date, email); return { email, name: personName(email, info.rec), info, state: dayState(info) }; })
+    .filter(x => x.info.total || x.info.rec)
+    .sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || cmpZh(a.name, b.name));
+}
+function teamHtml(date) {
+  const rows = teamFor(date), future = date > today();
+  if (!rows.length) {
+    return `<div class="empty"><h3>${md(date)} 沒有人需要做每日工作</h3><p>${D.tasks().length ? '可能是這天沒有排工作（例如假日），或還沒有人登入過 App。同事登入過一次就會自動出現在名單上。' : '還沒有設定每日工作項目。'}</p>
+      <div class="row"><button class="btn" type="button" data-dact="settings">工作項目設定</button></div></div>`;
+  }
+  const n = k => rows.filter(x => x.state === k).length;
+  const left = rows.reduce((a, x) => a + (x.info.total - x.info.done), 0);
+  const tiles = [
+    { l: '要做每日工作', v: rows.length, u: '人', s: md(date) + ' ' + wk(date) },
+    { l: '待主管確認', v: n('self'), u: '人', s: '已自行確認完成', tone: n('self') ? 'accent' : '' },
+    { l: '主管已確認', v: n('mgr'), u: '人', s: rows.length ? `${Math.round(n('mgr') / rows.length * 100)}%` : '' },
+    { l: '未完成項目', v: left, u: '項', s: `${n('todo')} 人還沒開始`, tone: left && !future && date < today() ? 'bad' : left ? 'warn' : '' },
+  ];
+  const bulk = future ? [] : rows.filter(x => x.state === 'self' && x.info.done >= x.info.total);
+  const days = [...Array(7)].map((_, i) => addDays(date, i - 6));
+  const strip = x => days.map(d => {
+    const inf = d === date ? x.info : dayItems(d, x.email), s = dayState(inf);
+    const tip = `${md(d)} ${wk(d)}：${STATE_LABEL[s]}${inf.total ? `（${inf.done}/${inf.total}）` : ''}`;
+    return `<button type="button" class="dd s-${s}${d === date ? ' cur' : ''}" data-dday="${d}" title="${esc(tip)}" aria-label="${esc(tip)}"></button>`;
+  }).join('');
+  const row = x => {
+    const r = x.info.rec;
+    let act = '';
+    if (x.state === 'mgr') act = seal('確認', isoDay(r.confirmAt), 'sm');
+    else if (!future) act = `<button class="btn sm${x.state === 'self' ? ' primary' : ''}" type="button" data-dact="mgr-confirm" data-email="${esc(x.email)}"${x.state === 'self' ? '' : ' data-confirm="還沒自行確認，仍要確認？"'}>主管確認</button>`;
+    return `<div class="arow trow">
+      <div class="arow-main">
+        <div class="meta-line"><span class="chip ${x.state}">${STATE_LABEL[x.state]}</span>${r && r.doneAt ? `<span>自行確認 ${esc(stamp(r.doneAt))}</span>` : ''}${r && r.returnNote && !r.doneAt ? '<span class="reason">已退回</span>' : ''}</div>
+        <button type="button" class="card-title" data-dperson="${esc(x.email)}">${esc(x.name)}</button>
+        <div class="tprog">${bar(x.info)}<span class="num">${x.info.done}/${x.info.total}</span></div>
+        ${r && r.note ? `<div class="hint">備註：${esc(r.note)}</div>` : ''}
+      </div>
+      <div class="strip" role="group" aria-label="${esc(x.name)} 近 7 天">${strip(x)}</div>
+      <div class="arow-act"><button class="btn sm" type="button" data-dperson="${esc(x.email)}">查看</button>${act}</div>
+    </div>`;
+  };
+  return `<div class="kpis k4">${tiles.map(t => `<div class="kpi static ${t.tone || ''}"><span class="k-label">${esc(t.l)}</span><span class="k-val">${t.v}<small>${t.u}</small></span><span class="k-sub">${esc(t.s)}</span></div>`).join('')}</div>
+    <div class="toolbar">
+      <div class="legend"><span><span class="dd s-mgr"></span>主管已確認</span><span><span class="dd s-self"></span>待主管確認</span><span><span class="dd s-doing"></span>進行中／已打勾</span><span><span class="dd s-todo"></span>未開始</span><span>方格是近 7 天，點一下切換日期</span></div>
+      <span class="spacer"></span>
+      ${bulk.length ? `<button class="btn primary sm" type="button" data-dact="mgr-bulk">一次確認 ${bulk.length} 位全部完成的人</button>` : ''}
+    </div>
+    <div class="arows">${rows.map(row).join('')}</div>`;
+}
+
+const DLOG = { confirm: '確認工作完成', unconfirm: '取消確認', mgr: '主管確認', 'mgr-undo': '取消主管確認', return: '主管退回' };
+const dlogLi = h => `<li><time>${esc(stamp(h.at))}</time><div><span>${esc(DLOG[h.act] || h.act)}</span>${h.by ? ` <span class="by">· ${esc(h.by)}</span>` : ''}${h.note ? `<div class="nt">「${esc(h.note)}」</div>` : ''}</div></li>`;
+function personDayHtml(date, email) {
+  const info = dayItems(date, email), r = info.rec, st = dayState(info), name = personName(email, r), e = esc(email);
+  const rows = info.items.map(i => `<li class="ck${i.done ? ' done' : ''}"><span class="ckbox" role="img" aria-label="${i.done ? '已完成' : '未完成'}">${i.done ? '✓' : ''}</span>
+    <span class="ck-t"><b>${esc(i.title)}</b>${i.kind === 'x' ? '<span class="tag-x">臨時</span>' : ''}</span>${i.done && i.at ? `<time>${esc(doneAtText(i.at, date))}</time>` : ''}</li>`).join('');
+  let mgr = '';
+  if (canTask() && date <= today()) {
+    mgr = r && r.confirmAt
+      ? `<div class="next ok"><h3>主管已確認 · ${esc(r.confirmBy || '')} ${esc(stamp(r.confirmAt))}</h3>${r.confirmNote ? `<p class="hint">主管意見：${esc(r.confirmNote)}</p>` : ''}<div class="row"><button class="btn sm" type="button" data-dact="mgr-undo" data-email="${e}" data-confirm="確定取消主管確認？">取消主管確認</button></div></div>`
+      : `<div class="next"><h3>${r && r.doneAt ? '已自行確認完成，等你確認' : '還沒自行確認'}</h3><input id="mnote" class="inp" maxlength="200" placeholder="主管意見（退回時必填）" aria-label="主管意見">
+        <div class="row"><button class="btn primary" type="button" data-dact="mgr-confirm" data-email="${e}" data-note="mnote">主管確認</button>${r && r.doneAt ? `<button class="btn danger" type="button" data-dact="mgr-return" data-email="${e}" data-note="mnote">退回</button>` : ''}</div></div>`;
+  }
+  return `<div class="dlg">
+    <div class="dlg-head">
+      <div><div class="eyebrow"><span>${md(date)} ${wk(date)}</span><span class="chip ${st}">${STATE_LABEL[st]}</span></div><h2>${esc(name)} 的工作</h2></div>
+      ${r && r.confirmAt ? seal('確認', isoDay(r.confirmAt), 'lg') : ''}
+      <button type="button" class="icon-btn" data-close aria-label="關閉">×</button>
+    </div>
+    <div class="dlg-body">
+      <div class="dprog"><span class="k-val">${info.done}<small>/ ${info.total} 項完成</small></span>${bar(info)}</div>
+      <ul class="checks ro">${rows || '<li class="empty-row">這天沒有工作項目。</li>'}</ul>
+      ${r && r.note ? `<div class="next"><h3>${esc(name)} 的備註</h3><p>${esc(r.note)}</p></div>` : ''}
+      ${mgr}
+      ${r && r.log && r.log.length ? `<section><h3 class="sub-h">紀錄</h3><ol class="timeline">${r.log.slice().reverse().map(dlogLi).join('')}</ol></section>` : ''}
+    </div>
+    <div class="dlg-foot"><button class="btn primary" type="button" data-close>完成</button></div>
+  </div>`;
+}
+function openPersonDay(email) {
+  openDialog(personDayHtml(S.dday, email));
+  S.dperson = email; S.dpday = S.dday;
+}
+
+function dailyAct(act, t) {
+  const r = dailyAct0(act, t);
+  // 主管在對話框裡確認／退回後立刻更新對話框（不等輸入框失焦）
+  if (r && /^mgr-/.test(act) && dlg.open && S.dperson) dlg.innerHTML = personDayHtml(S.dpday, S.dperson);
+  return r;
+}
+function dailyAct0(act, t) {
+  const date = S.dperson && dlg.open ? S.dpday : S.dday, me = myEmail(), d = t.dataset;
+  const needTask = () => { if (!canTask()) { toast('你沒有每日工作管理的權限。'); return false; } return true; };
+  switch (act) {
+    case 'settings': return openTaskSettings();
+    case 'preset': return addPresetTasks();
+    case 'xdel':
+      return saveDay(date, me, r => { if (lockedMsg(r)) return false; r.extras = (r.extras || []).filter(x => x.id !== d.id); });
+    case 'confirm': {
+      const info = dayItems(date, me), left = info.total - info.done, el = $('#dnote-me'), note = el ? el.value.trim() : '';
+      if (left && !note) { if (el) el.focus(); return toast(`還有 ${left} 項沒完成，請在備註寫原因再確認。`); }
+      return saveDay(date, me, r => {
+        if (lockedMsg(r)) return false;
+        r.note = note; r.doneAt = nowIso(); r.due = dueFor(date, me, null); r.returnNote = '';
+        logAdd(r, 'confirm', left ? note : '');
+      }, left ? `已確認，${left} 項未完成的原因已送出` : '已確認完成，辛苦了！');
+    }
+    case 'unconfirm':
+      return saveDay(date, me, r => {
+        if (r.confirmAt) { toast('主管已確認，不能取消。'); return false; }
+        if (!r.doneAt) return false;
+        r.doneAt = null; delete r.due; logAdd(r, 'unconfirm');
+      }, '已取消確認，可以繼續修改');
+    case 'mgr-confirm': {
+      if (!needTask()) return;
+      const email = d.email, note = noteVal(t);
+      return saveDay(date, email, r => {
+        if (r.confirmAt) return false;
+        if (!r.due) r.due = dueFor(date, email, null);
+        r.confirmAt = nowIso(); r.confirmBy = myName(); r.confirmNote = note; r.returnNote = '';
+        logAdd(r, 'mgr', note);
+      }, `已確認 ${personName(email)} 的工作`);
+    }
+    case 'mgr-undo':
+      if (!needTask()) return;
+      return saveDay(date, d.email, r => {
+        if (!r.confirmAt) return false;
+        r.confirmAt = null; r.confirmBy = ''; r.confirmNote = '';
+        if (!r.doneAt) delete r.due;
+        logAdd(r, 'mgr-undo');
+      }, '已取消主管確認');
+    case 'mgr-return': {
+      if (!needTask()) return;
+      const note = noteVal(t);
+      if (!note) { const el = document.getElementById(d.note); if (el) el.focus(); return toast('請填寫退回原因，讓對方知道要補什麼。'); }
+      return saveDay(date, d.email, r => {
+        r.doneAt = null; r.confirmAt = null; r.confirmBy = ''; delete r.due;
+        r.returnNote = note; r.returnBy = myName();
+        logAdd(r, 'return', note);
+      }, `已退回給 ${personName(d.email)}`);
+    }
+    case 'mgr-bulk': {
+      if (!needTask()) return;
+      const list = teamFor(date).filter(x => x.state === 'self' && x.info.done >= x.info.total);
+      const recs = list.map(x => dayNext(date, x.email, r => { r.confirmAt = nowIso(); r.confirmBy = myName(); r.confirmNote = ''; logAdd(r, 'mgr'); })).filter(Boolean);
+      if (!recs.length) return;
+      PBStore.saveMany('daily', recs);
+      return toast(`已確認 ${recs.length} 位同事的工作`);
+    }
+  }
+}
+function onDailyChange(e) {
+  const t = e.target, date = S.dday, me = myEmail();
+  if (date > today() && (t.dataset.check || t.dataset.xcheck)) { t.checked = !t.checked; return toast('這天還沒到，到了當天才能打勾。'); }
+  if (t.dataset.check) {
+    const id = t.dataset.check, item = dayItems(date, me).items.find(i => i.id === id && i.kind === 't');
+    const ok = saveDay(date, me, r => {
+      if (lockedMsg(r)) return false;
+      r.checks = r.checks || {};
+      if (t.checked) r.checks[id] = { at: nowIso(), t: item ? item.title : '' }; else delete r.checks[id];
+    });
+    if (!ok) t.checked = !t.checked;
+  } else if (t.dataset.xcheck) {
+    const ok = saveDay(date, me, r => {
+      if (lockedMsg(r)) return false;
+      const x = (r.extras || []).find(x => x.id === t.dataset.xcheck);
+      if (!x) return false;
+      x.done = t.checked; x.at = t.checked ? nowIso() : null;
+    });
+    if (!ok) t.checked = !t.checked;
+  } else if (t.id === 'dnote-me') {
+    const v = t.value.trim();
+    saveDay(date, me, r => { if (r.doneAt || r.confirmAt || (r.note || '') === v) return false; r.note = v; });
+    return;
+  } else return;
+  if (t.checked) {
+    const info = dayItems(date, me);
+    if (info.total && info.done >= info.total) toast('全部完成！記得按「確認工作完成」。');
+  }
+}
+function onDailySubmit(e) {
+  if (!e.target.matches('[data-addx]')) return;
+  e.preventDefault();
+  const inp = $('#xtitle'), title = inp.value.trim();
+  if (!title) return inp.focus();
+  if (S.dday > today()) return toast('這天還沒到，到了當天才能加入。');
+  const ok = saveDay(S.dday, myEmail(), r => { if (lockedMsg(r)) return false; r.extras = [...(r.extras || []), { id: rid(), title, done: false, at: null }]; });
+  if (ok) { inp.value = ''; inp.focus(); }
+}
+
+/* 工作項目設定（每日工作管理權限） */
+function openTaskSettings() {
+  if (!canTask()) return toast('你沒有每日工作管理的權限。');
+  const T = today(), tasks = D.tasks().slice().sort(taskSort);
+  const active = tasks.filter(t => !t.end || t.end >= T), stopped = tasks.filter(t => t.end && t.end < T);
+  const people = D.people().slice().sort((a, b) => cmpZh(a.name, b.name));
+  const row = (t, i, arr) => `<div class="arow">
+      <div class="arow-main"><b>${esc(t.title)}</b><span class="hint">${esc(whoText(t))} · ${esc(daysText(t.days))}${t.note ? ' · ' + esc(t.note) : ''}</span></div>
+      <div class="row">
+        <button class="icon-btn sm" type="button" data-tmove="-1" data-id="${esc(t.id)}" aria-label="往上移"${i === 0 ? ' disabled' : ''}>↑</button>
+        <button class="icon-btn sm" type="button" data-tmove="1" data-id="${esc(t.id)}" aria-label="往下移"${i === arr.length - 1 ? ' disabled' : ''}>↓</button>
+        <button class="btn sm" type="button" data-tedit="${esc(t.id)}">編輯</button>
+        <button class="btn sm" type="button" data-tstop="${esc(t.id)}" data-confirm="確定停用？">停用</button>
+      </div></div>`;
+  openDialog(`<div class="dlg">
+    <div class="dlg-head"><div><h2>每日工作項目設定</h2><p class="hint">設定每天固定要做的事。修改從今天起生效，已經確認過的日子保留當時的清單。</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body">
+      <section class="asec"><div class="row between"><h3>使用中的項目 <span class="n">${active.length}</span></h3><button class="btn sm primary" type="button" data-tedit="">＋ 新增工作項目</button></div>
+        <div class="arows">${active.map(row).join('') || '<p class="empty-row">還沒有項目。</p>'}</div>
+        <div class="row"><button class="btn sm" type="button" data-dact="preset">${active.length ? '補上建議的採購每日工作' : '套用建議的採購每日工作'}</button></div></section>
+      ${stopped.length ? `<section class="asec"><h3>已停用 <span class="n">${stopped.length}</span></h3><div class="arows">${stopped.map(t => `<div class="arow"><div class="arow-main"><b>${esc(t.title)}</b><span class="hint">停用於 ${md(addDays(t.end, 1))}</span></div>
+        <div class="row"><button class="btn sm" type="button" data-trestore="${esc(t.id)}">恢復</button><button class="btn sm danger" type="button" data-tdel="${esc(t.id)}" data-confirm="確定刪除？">刪除</button></div></div>`).join('')}</div></section>` : ''}
+      <section class="asec"><h3>誰要做每日工作</h3><p class="hint">登入過 App 的人會自動出現在這裡。取消勾選的人（例如老闆、只看資料的人）不會出現在「團隊確認」名單，也不會被「所有人」的項目排到。</p>
+        <div class="f">${people.length ? `<div class="perm-list">${people.map(p => `<label class="perm" for="poff-${esc(p.id)}"><input type="checkbox" id="poff-${esc(p.id)}" data-poff="${esc(p.id)}"${p.off ? '' : ' checked'}><span><b>${esc(p.name || p.email)}</b><span>${esc(p.email)}${p.seenAt ? ' · 最近使用 ' + md(p.seenAt) : ''}</span></span></label>`).join('')}</div>` : '<p class="hint">還沒有人登入過。</p>'}</div></section>
+    </div>
+    <div class="dlg-foot"><button class="btn primary" type="button" data-close>完成</button></div>
+  </div>`);
+}
+function openTaskForm(t) {
+  if (!canTask()) return;
+  const isEdit = !!t;
+  t = t || { title: '', note: '', who: null, days: [1, 2, 3, 4, 5] };
+  const specific = Array.isArray(t.who), days = Array.isArray(t.days) && t.days.length ? t.days : [0, 1, 2, 3, 4, 5, 6];
+  const people = D.people().slice().sort((a, b) => cmpZh(a.name, b.name)).map(p => ({ email: p.email || p.id, name: p.name }));
+  for (const e of specific ? t.who : []) if (!people.some(p => p.email === e)) people.push({ email: e, name: '' });
+  openDialog(`<form id="taskForm" class="dlg" novalidate>
+    <div class="dlg-head"><div><h2>${isEdit ? '編輯工作項目' : '新增工作項目'}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body form-grid">
+      <label class="f span2" for="t-title"><span class="req">工作名稱</span><input id="t-title" maxlength="60" value="${esc(t.title)}" placeholder="例如：確認今日請購需求" autofocus></label>
+      <label class="f span2" for="t-note">說明（選填）<input id="t-note" maxlength="120" value="${esc(t.note || '')}" placeholder="怎麼做、做到什麼程度算完成"></label>
+      <div class="f span2">哪幾天要做<div class="wkpick" role="group" aria-label="星期">${WEEK_ORDER.map(x => `<label class="wk" for="t-wk${x}"><input type="checkbox" id="t-wk${x}" data-wk value="${x}"${days.includes(x) ? ' checked' : ''}><span>${WK[x]}</span></label>`).join('')}</div></div>
+      <div class="f span2">誰要做
+        <div class="radios"><label class="radio" for="t-who-all"><input type="radio" id="t-who-all" name="t-who" value="all"${specific ? '' : ' checked'}>所有人</label><label class="radio" for="t-who-some"><input type="radio" id="t-who-some" name="t-who" value="some"${specific ? ' checked' : ''}>指定人員</label></div>
+        <div id="t-people" class="perm-list"${specific ? '' : ' hidden'}>${people.map(p => `<label class="perm" for="tp-${esc(p.email)}"><input type="checkbox" id="tp-${esc(p.email)}" data-tp value="${esc(p.email)}"${specific && t.who.includes(p.email) ? ' checked' : ''}><span><b>${esc(p.name || p.email)}</b><span>${esc(p.email)}</span></span></label>`).join('') || '<p class="hint">還沒有人登入過 App，暫時只能選「所有人」。</p>'}</div>
+      </div>
+      <p id="t-err" class="err span2" hidden></p>
+    </div>
+    <div class="dlg-foot">
+      ${isEdit ? `<div class="left"><button class="btn sm" type="button" data-tstop="${esc(t.id)}" data-confirm="確定停用？">停用</button></div>` : ''}
+      <button type="button" class="btn ghost" data-dact="settings">返回</button>
+      <button type="submit" class="btn primary">儲存</button>
+    </div>
+  </form>`, () => {
+    $$('input[name="t-who"]').forEach(r => r.addEventListener('change', () => { $('#t-people').hidden = !$('#t-who-some').checked; }));
+    $('#taskForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const err = $('#t-err'), fail = m => { err.textContent = m; err.hidden = false; };
+      const title = $('#t-title').value.trim();
+      if (!title) { $('#t-title').focus(); return fail('請填寫工作名稱。'); }
+      let wks = $$('[data-wk]').filter(i => i.checked).map(i => +i.value);
+      if (!wks.length) return fail('請至少選一天。');
+      if (wks.length === 7) wks = [];
+      const some = $('#t-who-some').checked, who = some ? $$('[data-tp]').filter(i => i.checked).map(i => i.value) : null;
+      if (some && !who.length) return fail('請勾選要做這項工作的人，或改成「所有人」。');
+      const data = { title, note: $('#t-note').value.trim(), days: wks, who, updatedAt: nowIso() };
+      if (isEdit) upd('tasks', t.id, data, `已更新「${title}」`);
+      else {
+        const max = D.tasks().reduce((a, x) => Math.max(a, num(x.order)), 0);
+        PBStore.save('tasks', { id: rid(), ...data, order: max + 10, start: today(), end: '', createdAt: nowIso() });
+        toast(`已新增「${title}」`);
+      }
+      openTaskSettings();
+    });
+  });
+}
+function addPresetTasks() {
+  if (!canTask()) return toast('你沒有每日工作管理的權限。');
+  const T = today(), have = new Set(D.tasks().filter(t => !t.end || t.end >= T).map(t => t.title.trim()));
+  let order = D.tasks().reduce((a, x) => Math.max(a, num(x.order)), 0);
+  const recs = PRESET_TASKS.filter(([title]) => !have.has(title)).map(([title, note]) => ({ id: rid(), title, note, days: [1, 2, 3, 4, 5], who: null, order: order += 10, start: T, end: '', createdAt: nowIso(), updatedAt: nowIso() }));
+  if (!recs.length) return toast('建議的項目都已經有了。');
+  PBStore.saveMany('tasks', recs);
+  toast(`已加入 ${recs.length} 個工作項目（週一至週五、所有人），可以再修改。`);
+  if (dlg.open) openTaskSettings();
+}
+function taskSettingAct(d) {
+  if (!canTask()) return toast('你沒有每日工作管理的權限。');
+  const T = today();
+  if ('tedit' in d) return openTaskForm(d.tedit ? PBStore.get('tasks', d.tedit) : null);
+  if (d.tmove) {
+    const list = D.tasks().filter(t => !t.end || t.end >= T).sort(taskSort);
+    const i = list.findIndex(t => t.id === d.id), j = i + (+d.tmove);
+    if (i < 0 || j < 0 || j >= list.length) return;
+    [list[i], list[j]] = [list[j], list[i]];
+    PBStore.saveMany('tasks', list.map((t, k) => ({ ...t, order: (k + 1) * 10 })));
+    return openTaskSettings();
+  }
+  if (d.tstop) {
+    const t = PBStore.get('tasks', d.tstop); if (!t) return;
+    const used = D.daily().some(r => (r.checks && r.checks[t.id]) || (r.due || []).some(x => x.id === t.id));
+    if (!used && (t.start || T) >= T) { PBStore.remove('tasks', t.id); toast(`已刪除「${t.title}」（還沒有人用過）`); }
+    else { upd('tasks', t.id, { end: addDays(T, -1), updatedAt: nowIso() }, `已停用「${t.title}」，從今天起不再排入`); }
+    return openTaskSettings();
+  }
+  if (d.trestore) { const t = PBStore.get('tasks', d.trestore); if (t) upd('tasks', t.id, { end: '', start: t.start && t.start > T ? T : t.start, updatedAt: nowIso() }, `已恢復「${t.title}」`); return openTaskSettings(); }
+  if (d.tdel) { const t = PBStore.get('tasks', d.tdel); if (t) { PBStore.remove('tasks', t.id); toast(`已刪除「${t.title}」，過去打勾的紀錄仍會保留`); } return openTaskSettings(); }
+}
+function onDialogChange(e) {
+  const t = e.target;
+  if (t.dataset.poff) { const p = PBStore.get('people', t.dataset.poff); if (p) upd('people', p.id, { off: !t.checked, updatedAt: nowIso() }, t.checked ? `${p.name || p.email} 會排入每日工作` : `${p.name || p.email} 不排入每日工作`); }
+}
+
 /* ---------- 對話框 ---------- */
 const dlg = $('#dlg');
-function openDialog(html, mount) { S.detailId = null; dlg.innerHTML = html; if (!dlg.open) dlg.showModal(); if (mount) mount(); const first = dlg.querySelector('[autofocus]'); if (first) first.focus(); }
+function openDialog(html, mount) { S.detailId = null; S.dperson = null; dlg.innerHTML = html; if (!dlg.open) dlg.showModal(); if (mount) mount(); const first = dlg.querySelector('[autofocus]'); if (first) first.focus(); }
 function closeDialog() { if (dlg.open) dlg.close(); }
-dlg.addEventListener('close', () => { S.detailId = null; dlg.innerHTML = ''; });
+dlg.addEventListener('close', () => { S.detailId = null; S.dperson = null; dlg.innerHTML = ''; });
 dlg.addEventListener('click', e => { if (e.target === dlg) closeDialog(); });
 function openDetail(id) { S.detailId = id; dlg.innerHTML = detailHtml(id); if (!dlg.open) dlg.showModal(); }
 
@@ -990,6 +1489,13 @@ document.addEventListener('click', e => {
   if (d.editUser) return openUserForm((U.list || []).find(u => u.email === d.editUser));
   if (d.toggleUser) { const u = (U.list || []).find(x => x.email === d.toggleUser); if (u) userCall('userSave', { email: u.email, name: u.name, pages: u.pages, enabled: !u.enabled }, u.enabled ? `已停用 ${u.email}` : `已啟用 ${u.email}`); return; }
   if (d.delUser) return userCall('userDelete', { email: d.delUser }, `已刪除 ${d.delUser}`);
+  if (d.dact) return dailyAct(d.dact, t);
+  if (d.dmode) { S.dmode = d.dmode; return render(); }
+  if (d.dday) { S.dday = d.dday; return render(); }
+  if (d.dperson) return openPersonDay(d.dperson);
+  if ('tedit' in d || d.tmove || d.tstop || d.trestore || d.tdel) return taskSettingAct(d);
+  if (d.go) { location.hash = d.go; return; }
+  if (d.goflag) { S.flag = d.goflag; if (S.view === 'orders') render(); else location.hash = 'orders'; return; }
   if (d.act) {
     if (d.act === 'clear-sample') return clearSample();
     if (d.act === 'delete-vendor') {
@@ -1013,6 +1519,13 @@ $('#day').addEventListener('change', e => { if (e.target.value) { S.day = e.targ
 $('#prevDay').addEventListener('click', () => { S.day = addDays(S.day, -1); S.scope = 'day'; S.flag = null; render(); });
 $('#nextDay').addEventListener('click', () => { S.day = addDays(S.day, 1); S.scope = 'day'; S.flag = null; render(); });
 $('#todayBtn').addEventListener('click', () => { S.day = today(); S.scope = 'day'; S.flag = null; render(); });
+$('#dday').addEventListener('change', e => { if (e.target.value) { S.dday = e.target.value; render(); } });
+$('#dprevDay').addEventListener('click', () => { S.dday = addDays(S.dday, -1); render(); });
+$('#dnextDay').addEventListener('click', () => { S.dday = addDays(S.dday, 1); render(); });
+$('#dtodayBtn').addEventListener('click', () => { S.dday = today(); render(); });
+$('#dailyBody').addEventListener('change', onDailyChange);
+$('#dailyBody').addEventListener('submit', onDailySubmit);
+dlg.addEventListener('change', onDialogChange);
 $('#oq').addEventListener('input', e => { S.q = e.target.value.trim(); renderOrders(); });
 $('#pq').addEventListener('input', e => { S.pq = e.target.value.trim(); renderVendors(); });
 $('#pvendor').addEventListener('change', e => { S.pvendor = e.target.value; renderVendors(); });
@@ -1030,7 +1543,7 @@ function toast(msg) {
 /* ---------- 啟動 ---------- */
 PBStore.on((type, payload) => {
   if (type === 'change') onData();
-  else if (type === 'status') { renderSync(); renderBanner(); }
+  else if (type === 'status') { renderSync(); renderBanner(); if (payload && payload.state === 'synced') ensureMe(); }
   else if (type === 'conflict') toast('有同事同時修改了同一筆資料，已自動合併；同一個欄位以你的修改為準。');
 });
 PBAuth.on(() => { route(); });
@@ -1040,5 +1553,5 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 // 跨日（App 開著過午夜）時，「今天」與逾期判斷跟著更新
 let lastDay = today();
-setInterval(() => { const t = today(); if (t !== lastDay) { if (S.day === lastDay) S.day = t; lastDay = t; render(); } }, 60000);
+setInterval(() => { const t = today(); if (t !== lastDay) { if (S.day === lastDay) S.day = t; if (S.dday === lastDay) S.dday = t; lastDay = t; ensureMe(); render(); } }, 60000);
 })();
