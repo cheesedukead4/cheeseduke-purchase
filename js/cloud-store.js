@@ -8,6 +8,7 @@
  *      tasks          每日工作項目（範本：做什麼、誰做、星期幾）
  *      people         人員名冊（登入過的人會自動加入，用來排每日工作）
  *      daily_YYYYMM   每日工作打勾與確認紀錄，一人一天一筆，依日期的年月分檔
+ *      events_YYYYMM  行事曆行程，依開始日期的年月分檔
  *  - 每類有雲端版本號；上傳時帶「我是根據哪一版改的」，有人搶先更新就先下載，以單筆（id）為單位三方合併後再上傳
  *  - 同一筆的同一個欄位被兩個人改成不同值時，以這台裝置的修改為準，並通知畫面提示
  *  - IndexedDB 名稱用 pb- 開頭，和同網域的其他網站不會互相影響
@@ -19,9 +20,9 @@
   var STORE = 'kv';
   var POLL_MS = 30000;
   var PUSH_DELAY_MS = 800;
-  var LABELS = { vendors: '廠商資料', products: '廠商產品', orders: '叫貨單', tasks: '每日工作項目', people: '人員名冊', daily: '每日工作紀錄' };
-  var MONTHLY = ['orders', 'daily'];   // 依日期年月分檔的種類（資料要有 date 欄位）
-  var KEY_RE = /^(vendors|products|tasks|people|(orders|daily)_\d{6})$/;
+  var LABELS = { vendors: '廠商資料', products: '廠商產品', orders: '叫貨單', tasks: '每日工作項目', people: '人員名冊', daily: '每日工作紀錄', events: '行事曆' };
+  var MONTHLY = ['orders', 'daily', 'events'];   // 依日期年月分檔的種類（資料要有 date 欄位）
+  var KEY_RE = /^(vendors|products|tasks|people|(orders|daily|events)_\d{6})$/;
 
   var parts = Object.create(null);   // 類別 -> JSON 字串（目前本機值，陣列）
   var bases = Object.create(null);   // 類別 -> 上次與雲端一致時的 JSON 字串（僅本機有未上傳修改時保存）
@@ -34,7 +35,7 @@
   var listeners = [];
   var idb = null;
 
-  function kindOf(key) { var m = /^(orders|daily)_\d{6}$/.exec(key); return m ? m[1] : key; }
+  function kindOf(key) { var m = /^(orders|daily|events)_\d{6}$/.exec(key); return m ? m[1] : key; }
   function label(key) {
     var k = kindOf(key);
     if (MONTHLY.indexOf(k) >= 0) { var ym = key.slice(-6); return LABELS[k] + '（' + ym.slice(0, 4) + '/' + ym.slice(4) + '）'; }

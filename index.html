@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>採購工作看板</title>
-<meta name="description" content="每日叫貨進度、每日工作打勾確認、兩關簽核與廠商產品查詢">
+<meta name="description" content="每日叫貨進度、每日工作打勾確認、團隊行事曆、兩關簽核與廠商產品查詢">
 <meta name="theme-color" content="#2445a3">
 <meta name="application-name" content="採購看板">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -35,6 +35,7 @@
     <nav class="tabs wrap" aria-label="功能">
       <a href="#orders" data-view="orders"><span class="t-long">叫貨進度</span><span class="t-short">叫貨</span></a>
       <a href="#daily" data-view="daily"><span class="t-long">每日工作</span><span class="t-short">工作</span> <span class="badge acc" id="dailyBadge" hidden></span></a>
+      <a href="#calendar" data-view="calendar">行事曆</a>
       <a href="#approvals" data-view="approvals">簽核 <span class="badge" id="apprBadge" hidden></span></a>
       <a href="#vendors" data-view="vendors"><span class="t-long">廠商產品查詢</span><span class="t-short">廠商</span></a>
       <a href="#users" data-view="users" id="usersTab" hidden><span class="t-long">人員與權限</span><span class="t-short">人員</span></a>
@@ -84,6 +85,24 @@
         <button class="btn" type="button" id="taskSetBtn" data-dact="settings" hidden>工作項目設定</button>
       </div>
       <div id="dailyBody" class="view"></div>
+    </section>
+
+    <section id="view-calendar" class="view" aria-label="行事曆" hidden>
+      <div class="toolbar">
+        <div class="daynav" role="group" aria-label="選擇月份">
+          <button class="icon-btn" id="cprev" type="button" aria-label="上個月">‹</button>
+          <h2 class="h2 cmonth" id="cmonthLabel" aria-live="polite"></h2>
+          <button class="icon-btn" id="cnext" type="button" aria-label="下個月">›</button>
+          <button class="btn ghost sm" id="ctodayBtn" type="button">回到今天</button>
+        </div>
+        <label class="tog" for="corders"><input type="checkbox" id="corders">顯示叫貨需求日</label>
+        <span class="spacer"></span>
+        <button class="btn primary" type="button" data-newev="">＋ 新增行程</button>
+      </div>
+      <div class="calwrap">
+        <div id="calGrid" class="calgrid"></div>
+        <aside id="calSide" class="agenda" aria-label="當天行程"></aside>
+      </div>
     </section>
 
     <section id="view-approvals" class="view" aria-label="簽核" hidden>

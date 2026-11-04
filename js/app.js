@@ -1,8 +1,8 @@
 /*
  * 採購工作看板：畫面程式
  * ---------------------------------------------------------------
- * 分頁：#orders 叫貨進度｜#daily 每日工作｜#approvals 簽核｜#vendors 廠商產品查詢｜#users 人員與權限（只有管理員）
- * 資料：PBStore（js/cloud-store.js）的 orders、vendors、products、tasks、people、daily，會同步給所有人
+ * 分頁：#orders 叫貨進度｜#daily 每日工作｜#calendar 行事曆｜#approvals 簽核｜#vendors 廠商產品查詢｜#users 人員與權限（只有管理員）
+ * 資料：PBStore（js/cloud-store.js）的 orders、vendors、products、tasks、people、daily、events，會同步給所有人
  * 權限：PBAuth.can(代號)，管理員全部都有。代號見 PERMS。這是畫面權限，雲端後端只擋「不在名單的人」。
  *
  * 叫貨單欄位：{ id, no, date, item, spec, qty, unit, vendorId, vendorName, price, amount, needBy, requester, note,
@@ -16,6 +16,8 @@
  * 每日紀錄 daily：{ id: 日期|email, date, email, name, checks: { 項目id: { at, t: 項目名稱 } }, extras: [{ id, title, done, at }],
  *   note, doneAt(自己確認), due: [{ id, t, n }](確認當下的清單), confirmAt, confirmBy, confirmNote(主管確認),
  *   returnNote, returnBy(主管退回), log: [{ id, act, by, at, note }], updatedAt }
+ * 行事曆 events：{ id, title, cat: meet|visit|deliver|remind|leave|other, date, end(跨天的最後一天，可空), time, endTime, note,
+ *   createdBy(email), byName, createdAt, updatedAt }
  */
 (function () {
 'use strict';
@@ -68,9 +70,10 @@ const D = {
   tasks: () => PBStore.list('tasks'),
   people: () => PBStore.list('people'),
   daily: () => PBStore.list('daily'),
+  events: () => PBStore.list('events'),
 };
 let vById = new Map();
-const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
+const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, cmonth: today().slice(0, 7), cday: today(), corders: true, scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
 const can = p => !!(window.PBAuth && PBAuth.can(p));
 const isAdmin = () => !!(window.PBAuth && PBAuth.isAdmin());
 const myName = () => (window.PBAuth && (PBAuth.name() || PBAuth.email())) || '';
@@ -94,6 +97,7 @@ function render() {
   renderChrome();
   if (S.view === 'orders') renderOrders();
   else if (S.view === 'daily') renderDaily();
+  else if (S.view === 'calendar') renderCalendar();
   else if (S.view === 'approvals') renderApprovals();
   else if (S.view === 'vendors') renderVendors();
   else renderUsers();
@@ -110,7 +114,7 @@ function render() {
 }
 function route() {
   const h = location.hash.slice(1);
-  let v = ['orders', 'daily', 'approvals', 'vendors', 'users'].includes(h) ? h : 'orders';
+  let v = ['orders', 'daily', 'calendar', 'approvals', 'vendors', 'users'].includes(h) ? h : 'orders';
   if (v === 'users' && !isAdmin()) v = 'orders';
   S.view = v;
   $$('main > .view').forEach(s => { s.hidden = s.id !== 'view-' + S.view; });
@@ -559,7 +563,7 @@ function myDayHtml(date) {
       ${canTask() ? '<div class="row"><button class="btn primary" type="button" data-dact="preset">套用建議的採購每日工作</button><button class="btn" type="button" data-dact="settings">自己設定工作項目</button></div><p class="small">建議項目可以再修改、停用，也可以只指派給特定的人。</p>' : ''}
     </div>` : '';
   const rows = info.items.map(i => checkRow(i, locked, date)).join('');
-  return `${setup}${date === today() ? boardHints() : ''}<div class="dsheet">
+  return `${setup}${date === today() ? boardHints() : ''}${dayEventsHint(date)}<div class="dsheet">
     <div class="dhead">
       <div class="dhead-t"><span class="chip ${st}">${STATE_LABEL[st]}</span><h2 class="h2">${esc(myName())} 的工作</h2></div>
       <div class="dprog"><span class="k-val">${info.done}<small>/ ${info.total} 項完成</small></span>${bar(info)}</div>
@@ -897,6 +901,183 @@ function taskSettingAct(d) {
 function onDialogChange(e) {
   const t = e.target;
   if (t.dataset.poff) { const p = PBStore.get('people', t.dataset.poff); if (p) upd('people', p.id, { off: !t.checked, updatedAt: nowIso() }, t.checked ? `${p.name || p.email} 會排入每日工作` : `${p.name || p.email} 不排入每日工作`); }
+}
+
+/* ---------- 行事曆 ---------- */
+// 共用的團隊行事曆：每個人都能新增行程；建立的人、管理員和有「每日工作管理」權限的人可以修改刪除。
+// 可以疊上「叫貨需求日」（未到貨的叫貨單），點一下開叫貨單。
+const CAL_CATS = [
+  { k: 'meet', label: '會議' },
+  { k: 'visit', label: '廠商來訪' },
+  { k: 'deliver', label: '交貨／到貨' },
+  { k: 'remind', label: '提醒／截止' },
+  { k: 'leave', label: '休假' },
+  { k: 'other', label: '其他' },
+];
+const CAT_LABEL = Object.fromEntries(CAL_CATS.map(c => [c.k, c.label]));
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+};
+const evEnd = e => (e.end && e.end > e.date ? e.end : e.date);
+const canEditEv = e => isAdmin() || canTask() || e.createdBy === myEmail();
+const evTime = e => e.time ? e.time + (e.endTime ? '–' + e.endTime : '') : '全天';
+const evRange = e => evEnd(e) !== e.date ? `${md(e.date)}–${md(evEnd(e))}` : `${md(e.date)} ${wk(e.date)}`;
+const openOrder = o => !['received', 'cancelled'].includes(o.progress);
+const itemTitle = it => it.type === 'ev' ? it.e.title : it.o.item;
+const itemSort = (a, b) => ((a.type === 'ord') - (b.type === 'ord')) || cmpZh(a.type === 'ev' ? a.e.time || '' : '', b.type === 'ev' ? b.e.time || '' : '') || cmpZh(itemTitle(a), itemTitle(b));
+
+// 某段日期內每天有哪些行程（跨天的行程每一天都列）
+function calIndex(from, to) {
+  const m = new Map(), add = (d, it) => { if (!m.has(d)) m.set(d, []); m.get(d).push(it); };
+  for (const e of D.events()) {
+    if (!e.date || evEnd(e) < from || e.date > to) continue;
+    let d = e.date < from ? from : e.date, n = 0;
+    const last = evEnd(e) > to ? to : evEnd(e);
+    while (d <= last && n++ < 400) { add(d, { type: 'ev', e }); d = addDays(d, 1); }
+  }
+  if (S.corders) for (const o of D.orders()) if (o.needBy && o.needBy >= from && o.needBy <= to && openOrder(o)) add(o.needBy, { type: 'ord', o });
+  for (const arr of m.values()) arr.sort(itemSort);
+  return m;
+}
+function evChip(it, short) {
+  if (it.type === 'ord') {
+    const o = it.o, over = isOverdue(o);
+    return `<button type="button" class="evc c-order${over ? ' over' : ''}" data-open="${esc(o.id)}" title="${esc(`需求日：${o.item} ${qtyf(o.qty)}${o.unit || ''}（${vendorName(o)}）${over ? '，已逾期' : ''}`)}">${short ? '' : `<span class="evc-t">到貨 ${esc(o.item)}</span>`}</button>`;
+  }
+  const e = it.e;
+  return `<button type="button" class="evc c-${esc(e.cat || 'other')}" data-ev="${esc(e.id)}" title="${esc(`${evTime(e)} ${e.title}（${CAT_LABEL[e.cat] || '其他'}）`)}">${short ? '' : `<span class="evc-t">${e.time ? `<i>${esc(e.time)}</i>` : ''}${esc(e.title)}</span>`}</button>`;
+}
+
+function renderCalendar() {
+  const [y, m] = S.cmonth.split('-').map(Number);
+  $('#cmonthLabel').textContent = `${y} 年 ${m} 月`;
+  $('#ctodayBtn').hidden = S.cmonth === today().slice(0, 7) && S.cday === today();
+  $('#corders').checked = S.corders;
+  const first = new Date(y, m - 1, 1), start = addDays(ymd(first), -first.getDay());
+  let days = [...Array(42)].map((_, i) => addDays(start, i));
+  const cut = days.findIndex((d, i) => i % 7 === 0 && d.slice(0, 7) > S.cmonth);
+  if (cut > 0) days = days.slice(0, cut);
+  const idx = calIndex(days[0], days[days.length - 1]), T = today();
+  const cells = days.map(d => {
+    const items = idx.get(d) || [], out = d.slice(0, 7) !== S.cmonth, n = items.length;
+    const shown = items.slice(0, 3), more = n - shown.length;
+    const label = `${+d.slice(5, 7)}月${+d.slice(8)}日 ${wk(d)}${n ? `，${n} 個行程` : ''}`;
+    return `<div class="cell${out ? ' out' : ''}${d === T ? ' today' : ''}${d === S.cday ? ' sel' : ''}" data-cday="${d}">
+      <button type="button" class="cell-n" data-cday="${d}" aria-label="${esc(label)}"${d === S.cday ? ' aria-pressed="true"' : ''}>${+d.slice(8)}</button>
+      <div class="cell-items">${shown.map(it => evChip(it)).join('')}${more > 0 ? `<button type="button" class="evmore" data-cday="${d}">還有 ${more} 個</button>` : ''}</div>
+      <div class="cell-dots" aria-hidden="true">${items.slice(0, 4).map(it => `<i class="c-${it.type === 'ord' ? 'order' : esc(it.e.cat || 'other')}"></i>`).join('')}</div>
+    </div>`;
+  }).join('');
+  $('#calGrid').innerHTML = `<div class="cal" style="--rows:${days.length / 7}">
+    ${[...WK].map((w, i) => `<div class="cal-h${i === 0 || i === 6 ? ' we' : ''}">${w}</div>`).join('')}${cells}</div>`;
+  $('#calSide').innerHTML = agendaHtml();
+}
+function agendaRow(it, showDate) {
+  if (it.type === 'ord') {
+    const o = it.o, over = isOverdue(o);
+    return `<div class="agrow"><span class="ag-time${over ? ' bad-t' : ''}">${showDate ? md(o.needBy) + '<br>' : ''}需求日</span>
+      <button type="button" class="ag-main" data-open="${esc(o.id)}"><b><span class="dotc c-order"></span>到貨 ${esc(o.item)}${o.spec ? ` <span class="spec">${esc(o.spec)}</span>` : ''}</b>
+      <span class="hint">${qtyf(o.qty)} ${esc(o.unit || '')} · ${esc(vendorName(o))} · ${esc(PROG_LABEL[o.progress] || '')}${over ? ' · <span class="bad-t">逾期</span>' : ''}</span></button></div>`;
+  }
+  const e = it.e;
+  return `<div class="agrow"><span class="ag-time">${showDate ? esc(evEnd(e) !== e.date ? evRange(e) : md(e.date)) + '<br>' : ''}${esc(e.time || '全天')}${e.time && e.endTime ? `<br><span class="muted">${esc(e.endTime)}</span>` : ''}</span>
+    <button type="button" class="ag-main" data-ev="${esc(e.id)}"><b><span class="dotc c-${esc(e.cat || 'other')}"></span>${esc(e.title)}</b>
+    <span class="hint">${esc(CAT_LABEL[e.cat] || '其他')}${!showDate && evEnd(e) !== e.date ? ' · ' + esc(evRange(e)) : ''}${e.byName ? ' · ' + esc(e.byName) : ''}</span>${e.note ? `<span class="ag-note">${esc(e.note)}</span>` : ''}</button></div>`;
+}
+function agendaHtml() {
+  const d = S.cday, items = calIndex(d, d).get(d) || [], T = today();
+  const end = addDays(T, 14);
+  const upcoming = D.events().filter(e => e.date && evEnd(e) >= T && e.date <= end && !(e.date <= d && d <= evEnd(e)))
+    .sort((a, b) => cmpZh(a.date, b.date) || cmpZh(a.time || '', b.time || '')).slice(0, 8);
+  return `<section class="agsec">
+      <header class="ag-h"><h3>${md(d)} ${wk(d)}${d === T ? ' · 今天' : ''}</h3><button class="btn sm primary" type="button" data-newev="${d}">＋ 新增</button></header>
+      <div class="ag-list">${items.map(it => agendaRow(it)).join('') || `<p class="empty-row">這天沒有行程。${!loaded() ? '（資料讀取中…）' : ''}</p>`}</div>
+    </section>
+    <section class="agsec">
+      <header class="ag-h"><h3>接下來兩週</h3></header>
+      <div class="ag-list">${upcoming.map(e => agendaRow({ type: 'ev', e }, true)).join('') || '<p class="empty-row">沒有其他行程。</p>'}</div>
+    </section>`;
+}
+
+function evDetailHtml(e) {
+  const can_ = canEditEv(e);
+  return `<div class="dlg">
+    <div class="dlg-head"><div><div class="eyebrow"><span class="dotc c-${esc(e.cat || 'other')}"></span><span>${esc(CAT_LABEL[e.cat] || '其他')}</span></div><h2>${esc(e.title)}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body">
+      <dl class="facts">
+        <div><dt>日期</dt><dd>${esc(evRange(e))}</dd></div>
+        <div><dt>時間</dt><dd>${esc(evTime(e))}</dd></div>
+        <div><dt>建立</dt><dd>${esc(e.byName || e.createdBy || '—')}</dd></div>
+        ${e.note ? `<div class="span-all"><dt>說明</dt><dd class="pre">${esc(e.note)}</dd></div>` : ''}
+      </dl>
+      ${can_ ? '' : '<p class="hint">只有建立的人、管理員和每日工作主管可以修改這個行程。</p>'}
+    </div>
+    <div class="dlg-foot">
+      ${can_ ? `<div class="left"><button class="btn sm danger" type="button" data-evdel="${esc(e.id)}" data-confirm="確定刪除？">刪除</button></div><button class="btn" type="button" data-evedit="${esc(e.id)}">修改</button>` : ''}
+      <button class="btn primary" type="button" data-close>完成</button>
+    </div>
+  </div>`;
+}
+function openEventDetail(id) {
+  const e = PBStore.get('events', id);
+  if (!e) return toast('找不到這個行程，可能已被刪除。');
+  openDialog(evDetailHtml(e));
+}
+function openEventForm(ev, date) {
+  const isEdit = !!ev;
+  if (isEdit && !canEditEv(ev)) return toast('只有建立的人、管理員和每日工作主管可以修改這個行程。');
+  ev = ev || { title: '', date: date || S.cday || today(), end: '', time: '', endTime: '', cat: 'meet', note: '' };
+  openDialog(`<form id="evForm" class="dlg" novalidate>
+    <div class="dlg-head"><div><h2>${isEdit ? '修改行程' : '新增行程'}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body form-grid">
+      <label class="f span2" for="e-title"><span class="req">標題</span><input id="e-title" maxlength="60" value="${esc(ev.title)}" placeholder="例如：大成五金來訪報價" autofocus></label>
+      <label class="f" for="e-cat">類別<select id="e-cat">${CAL_CATS.map(c => `<option value="${c.k}"${c.k === (ev.cat || 'other') ? ' selected' : ''}>${c.label}</option>`).join('')}</select></label>
+      <span class="f"></span>
+      <label class="f" for="e-date"><span class="req">日期</span><input id="e-date" type="date" value="${esc(ev.date)}"></label>
+      <label class="f" for="e-end">結束日期（跨天才填）<input id="e-end" type="date" value="${esc(ev.end && ev.end > ev.date ? ev.end : '')}"></label>
+      <label class="f" for="e-time">開始時間（全天不用填）<input id="e-time" type="time" value="${esc(ev.time || '')}"></label>
+      <label class="f" for="e-etime">結束時間<input id="e-etime" type="time" value="${esc(ev.endTime || '')}"></label>
+      <label class="f span2" for="e-note">說明<textarea id="e-note" rows="3" maxlength="500" placeholder="地點、聯絡人、要準備的東西">${esc(ev.note || '')}</textarea></label>
+      <p id="e-err" class="err span2" hidden></p>
+    </div>
+    <div class="dlg-foot">
+      ${isEdit ? `<div class="left"><button class="btn sm danger" type="button" data-evdel="${esc(ev.id)}" data-confirm="確定刪除？">刪除</button></div>` : ''}
+      <button type="button" class="btn ghost" data-close>取消</button>
+      <button type="submit" class="btn primary">儲存</button>
+    </div>
+  </form>`, () => {
+    $('#evForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const g = id => $('#' + id).value.trim(), err = $('#e-err'), fail = (m, id) => { err.textContent = m; err.hidden = false; if (id) $('#' + id).focus(); };
+      const title = g('e-title'), date = g('e-date'), end = g('e-end'), time = g('e-time'), endTime = g('e-etime');
+      if (!title) return fail('請填寫標題。', 'e-title');
+      if (!date) return fail('請選擇日期。', 'e-date');
+      if (end && end < date) return fail('結束日期不能早於開始日期。', 'e-end');
+      if (endTime && !time) return fail('有結束時間的話，也要填開始時間。', 'e-time');
+      if (time && endTime && endTime <= time && !(end && end > date)) return fail('結束時間要晚於開始時間。', 'e-etime');
+      const data = { title, cat: g('e-cat'), date, end: end && end > date ? end : '', time, endTime: time ? endTime : '', note: g('e-note'), updatedAt: nowIso() };
+      closeDialog();
+      S.cday = date; S.cmonth = date.slice(0, 7);
+      if (isEdit) upd('events', ev.id, data, `已更新「${title}」`);
+      else { PBStore.save('events', { id: rid(), ...data, createdBy: myEmail(), byName: myName(), createdAt: nowIso() }); toast(`已新增「${title}」`); }
+      if (S.view === 'calendar') render();
+    });
+  });
+}
+function deleteEvent(id) {
+  const e = PBStore.get('events', id);
+  if (!e) return closeDialog();
+  if (!canEditEv(e)) return toast('只有建立的人、管理員和每日工作主管可以刪除這個行程。');
+  closeDialog();
+  PBStore.remove('events', id);
+  toast(`已刪除「${e.title}」`);
+}
+// 每日工作頁上方：這天的行程
+function dayEventsHint(date) {
+  const items = (calIndex(date, date).get(date) || []).filter(it => it.type === 'ev');
+  if (!items.length) return '';
+  return `<div class="hintbar dayev">${date === today() ? '今天' : md(date)}的行程：${items.map(({ e }) => `<button type="button" class="hchip ev c-${esc(e.cat || 'other')}" data-ev="${esc(e.id)}"><span class="dotc c-${esc(e.cat || 'other')}"></span>${e.time ? esc(e.time) + ' ' : ''}${esc(e.title)}</button>`).join('')}</div>`;
 }
 
 /* ---------- 對話框 ---------- */
@@ -1458,7 +1639,7 @@ function arm(t) {
   setTimeout(() => { if (t.isConnected && t.classList.contains('arm')) { t.classList.remove('arm'); t.textContent = orig; } }, 4000);
 }
 document.addEventListener('click', e => {
-  const t = e.target.closest('button, [data-open]');
+  const t = e.target.closest('button, [data-open], [data-cday]');
   if (!t || t.closest('#f-offers') || t.closest('#loginGate')) return;
   const d = t.dataset;
   if (d.confirm && !t.classList.contains('arm')) { arm(t); return; }
@@ -1489,6 +1670,11 @@ document.addEventListener('click', e => {
   if (d.editUser) return openUserForm((U.list || []).find(u => u.email === d.editUser));
   if (d.toggleUser) { const u = (U.list || []).find(x => x.email === d.toggleUser); if (u) userCall('userSave', { email: u.email, name: u.name, pages: u.pages, enabled: !u.enabled }, u.enabled ? `已停用 ${u.email}` : `已啟用 ${u.email}`); return; }
   if (d.delUser) return userCall('userDelete', { email: d.delUser }, `已刪除 ${d.delUser}`);
+  if (d.cday) { S.cday = d.cday; S.cmonth = d.cday.slice(0, 7); return render(); }
+  if (d.ev) return openEventDetail(d.ev);
+  if ('newev' in d) return openEventForm(null, d.newev || S.cday);
+  if (d.evedit) return openEventForm(PBStore.get('events', d.evedit));
+  if (d.evdel) return deleteEvent(d.evdel);
   if (d.dact) return dailyAct(d.dact, t);
   if (d.dmode) { S.dmode = d.dmode; return render(); }
   if (d.dday) { S.dday = d.dday; return render(); }
@@ -1524,6 +1710,12 @@ $('#dprevDay').addEventListener('click', () => { S.dday = addDays(S.dday, -1); r
 $('#dnextDay').addEventListener('click', () => { S.dday = addDays(S.dday, 1); render(); });
 $('#dtodayBtn').addEventListener('click', () => { S.dday = today(); render(); });
 $('#dailyBody').addEventListener('change', onDailyChange);
+const shiftMonth = n => { const [y, m] = S.cmonth.split('-').map(Number), d = new Date(y, m - 1 + n, 1); S.cmonth = ymd(d).slice(0, 7); S.cday = S.cmonth === today().slice(0, 7) ? today() : S.cmonth + '-01'; render(); };
+$('#cprev').addEventListener('click', () => shiftMonth(-1));
+$('#cnext').addEventListener('click', () => shiftMonth(1));
+$('#ctodayBtn').addEventListener('click', () => { S.cday = today(); S.cmonth = S.cday.slice(0, 7); render(); });
+$('#corders').addEventListener('change', e => { S.corders = e.target.checked; LS.set('pb_cal_orders', S.corders); render(); });
+S.corders = LS.get('pb_cal_orders', true) !== false;
 $('#dailyBody').addEventListener('submit', onDailySubmit);
 dlg.addEventListener('change', onDialogChange);
 $('#oq').addEventListener('input', e => { S.q = e.target.value.trim(); renderOrders(); });
@@ -1553,5 +1745,5 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 // 跨日（App 開著過午夜）時，「今天」與逾期判斷跟著更新
 let lastDay = today();
-setInterval(() => { const t = today(); if (t !== lastDay) { if (S.day === lastDay) S.day = t; if (S.dday === lastDay) S.dday = t; lastDay = t; ensureMe(); render(); } }, 60000);
+setInterval(() => { const t = today(); if (t !== lastDay) { if (S.day === lastDay) S.day = t; if (S.dday === lastDay) S.dday = t; if (S.cday === lastDay) { S.cday = t; S.cmonth = t.slice(0, 7); } lastDay = t; ensureMe(); render(); } }, 60000);
 })();
