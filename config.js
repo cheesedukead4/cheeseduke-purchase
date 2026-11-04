@@ -6,7 +6,7 @@
  * PB_CLOUD.url：採購工作看板的 Apps Script 網頁應用程式網址（結尾 /exec），見「使用說明.md」第 2 步。
  */
 window.PB_AUTH = {
-  clientId: '' // ← 貼上用戶端 ID，例如 '123456-abcdef.apps.googleusercontent.com'
+  clientId: '1032684487693-seh15gffo8q1fcsmk3vr47m1e02far2o.apps.googleusercontent.com'
 };
 
 window.PB_CLOUD = {
