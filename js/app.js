@@ -1,0 +1,1044 @@
+/*
+ * 採購工作看板：畫面程式
+ * ---------------------------------------------------------------
+ * 分頁：#orders 叫貨進度｜#approvals 簽核｜#vendors 廠商產品查詢｜#users 人員與權限（只有管理員）
+ * 資料：PBStore（js/cloud-store.js）的 orders、vendors、products，會同步給所有人
+ * 權限：PBAuth.can(代號)，管理員全部都有。代號見 PERMS。這是畫面權限，雲端後端只擋「不在名單的人」。
+ *
+ * 叫貨單欄位：{ id, no, date, item, spec, qty, unit, vendorId, vendorName, price, amount, needBy, requester, note,
+ *   progress: todo|ordered|partial|received|cancelled, approval: draft|l1|l2|approved|rejected,
+ *   receivedQty, createdBy, createdAt, submittedAt, approvedAt, orderedAt, receivedAt, rejectNote, prevProgress,
+ *   history: [{ id, act, by, role, at, note, to, add }], sample?, updatedAt }
+ * 廠商：{ id, name, category, contact, phone, email, terms, leadDays, note, sample? }
+ * 產品：{ id, vendorId, name, spec, category, unit, price, moq, leadDays, note, sample? }
+ */
+(function () {
+'use strict';
+
+/* ---------- 小工具 ---------- */
+const $ = (s, el) => (el || document).querySelector(s);
+const $$ = (s, el) => [...(el || document).querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pad = n => String(n).padStart(2, '0');
+const ymd = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+const today = () => ymd(new Date());
+const parseYmd = s => { const [y, m, d] = String(s).split('-').map(Number); return new Date(y, (m || 1) - 1, d || 1); };
+const addDays = (s, n) => { const d = parseYmd(s); d.setDate(d.getDate() + n); return ymd(d); };
+const daysBetween = (a, b) => Math.round((parseYmd(b) - parseYmd(a)) / 86400000);
+const WK = '日一二三四五六';
+const md = s => s ? (+s.slice(5, 7)) + '/' + (+s.slice(8, 10)) : '—';
+const wk = s => '週' + WK[parseYmd(s).getDay()];
+const stamp = iso => { if (!iso) return ''; const d = new Date(iso); if (isNaN(d)) return ''; return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+const isoDay = iso => { if (!iso) return ''; const d = new Date(iso); return isNaN(d) ? '' : ymd(d); };
+const num = v => { const n = parseFloat(String(v ?? '').replace(/,/g, '')); return Number.isFinite(n) ? n : 0; };
+const money = n => 'NT$' + Math.round(num(n)).toLocaleString('zh-TW');
+const price = n => 'NT$' + num(n).toLocaleString('zh-TW', { maximumFractionDigits: 2 });
+const qtyf = n => num(n).toLocaleString('zh-TW', { maximumFractionDigits: 2 });
+const nowIso = () => new Date().toISOString();
+const cmpZh = (a, b) => String(a || '').localeCompare(String(b || ''), 'zh-Hant');
+const rid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+const PROGRESS = [
+  { k: 'todo', label: '待叫貨' },
+  { k: 'ordered', label: '已叫貨' },
+  { k: 'partial', label: '部分到貨' },
+  { k: 'received', label: '已到貨' },
+];
+const PROG_LABEL = { todo: '待叫貨', ordered: '已叫貨', partial: '部分到貨', received: '已到貨', cancelled: '已取消' };
+const APPR = { draft: '草稿', l1: '待主管簽核', l2: '待經理核准', approved: '已核准', rejected: '退回' };
+const PERMS = [
+  { id: 'order', label: '叫貨', desc: '新增、修改叫貨單，送出簽核，標記已叫貨、登記到貨' },
+  { id: 'approve1', label: '主管簽核', desc: '第一關：核准或退回送簽的叫貨單' },
+  { id: 'approve2', label: '經理核准', desc: '第二關：核准後才能叫貨' },
+  { id: 'vendor', label: '廠商產品維護', desc: '新增、修改廠商與產品報價，從 Excel 匯入' },
+];
+const PERM_LABEL = Object.fromEntries(PERMS.map(p => [p.id, p.label]));
+
+/* ---------- 資料與權限 ---------- */
+const D = {
+  orders: () => PBStore.list('orders'),
+  vendors: () => PBStore.list('vendors'),
+  products: () => PBStore.list('products'),
+};
+let vById = new Map();
+const S = { view: 'orders', day: today(), scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
+const can = p => !!(window.PBAuth && PBAuth.can(p));
+const isAdmin = () => !!(window.PBAuth && PBAuth.isAdmin());
+const myName = () => (window.PBAuth && (PBAuth.name() || PBAuth.email())) || '';
+const canApprove = o => (o.approval === 'l1' && can('approve1')) || (o.approval === 'l2' && can('approve2'));
+
+function upd(kind, id, patch, msg) {
+  const cur = PBStore.get(kind, id);
+  if (!cur) { toast('找不到這筆資料，可能已被別人刪除。'); return false; }
+  PBStore.save(kind, { ...cur, ...patch });
+  if (msg) toast(msg);
+  return true;
+}
+function histAdd(o, entry) { return [...(o.history || []), { id: rid(), by: myName(), at: nowIso(), ...entry }]; }
+
+/* ---------- 畫面更新 ---------- */
+// 用 setTimeout 合併多次更新（不用 requestAnimationFrame：App 在背景時它會暫停，切回來前畫面不會更新）
+let rq = 0;
+function scheduleRender() { if (rq) return; rq = setTimeout(() => { rq = 0; render(); }, 16); }
+function onData() { vById = new Map(D.vendors().map(v => [v.id, v])); scheduleRender(); }
+function render() {
+  renderChrome();
+  if (S.view === 'orders') renderOrders();
+  else if (S.view === 'approvals') renderApprovals();
+  else if (S.view === 'vendors') renderVendors();
+  else renderUsers();
+  if (dlg.open && S.detailId) {
+    const a = document.activeElement;
+    const typing = a && dlg.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+    if (!typing) dlg.innerHTML = detailHtml(S.detailId);
+  }
+}
+function route() {
+  const h = location.hash.slice(1);
+  let v = ['orders', 'approvals', 'vendors', 'users'].includes(h) ? h : 'orders';
+  if (v === 'users' && !isAdmin()) v = 'orders';
+  S.view = v;
+  $$('main > .view').forEach(s => { s.hidden = s.id !== 'view-' + S.view; });
+  $$('.tabs a').forEach(a => a.setAttribute('aria-current', a.dataset.view === S.view ? 'page' : 'false'));
+  if (v === 'users') loadUsers();
+  render();
+}
+function renderChrome() {
+  $('#meName').textContent = myName();
+  $('#newOrderBtn').hidden = !can('order');
+  $('#usersTab').hidden = !isAdmin();
+  $('#vendorTools').hidden = !can('vendor');
+  renderSync(); renderBanner(); renderBadge();
+}
+function renderSync() {
+  const st = PBStore.status(), el = $('#sync');
+  const map = {
+    loading: ['busy', '讀取中…'], syncing: ['busy', '同步中…'], pending: ['busy', '等待上傳'],
+    synced: ['ok', '已同步'], offline: ['warn', '離線'], error: ['bad', '連線失敗'],
+  };
+  const [cls, txt] = map[st.state] || ['', st.state];
+  const html = `<i aria-hidden="true"></i>${esc(txt)}`;
+  if (el.innerHTML !== html) el.innerHTML = html;
+  el.className = 'sync ' + cls;
+  el.title = (st.detail ? st.detail + '。' : '') + (st.lastSync ? '上次同步 ' + stamp(new Date(st.lastSync).toISOString()) + '。' : '') + '按一下立即同步';
+}
+let lastBanner = '';
+function renderBanner() {
+  const st = PBStore.status(), b = [];
+  if (st.state === 'error') b.push(`<div class="banner bad">${esc(st.detail || '無法連線到雲端')}<button class="btn sm" type="button" data-sync>重試</button></div>`);
+  else if (st.state === 'offline') b.push(`<div class="banner warn">${esc(st.detail || '目前離線')}。修改會先存在這台裝置，恢復網路後自動上傳。</div>`);
+  const n = sampleCount();
+  if (n && isAdmin()) b.push(`<div class="banner">目前有 ${n} 筆範例資料（標有「範例」）。開始正式使用前請清除。<button class="btn sm" type="button" data-act="clear-sample" data-confirm="確定清除全部範例？">清除範例資料</button></div>`);
+  if (window.PBAuth && PBAuth.user() && !isAdmin() && !PERMS.some(p => can(p.id))) b.push(`<div class="banner">你目前只能查看。需要新增叫貨或簽核的話，請找管理員開權限。</div>`);
+  const html = b.join('');
+  if (html !== lastBanner) { $('#banner').innerHTML = html; lastBanner = html; }
+}
+function renderBadge() {
+  const n = D.orders().filter(o => o.progress !== 'cancelled' && canApprove(o)).length;
+  const el = $('#apprBadge'); el.hidden = !n; el.textContent = n;
+}
+const sampleCount = () => ['orders', 'vendors', 'products'].reduce((a, k) => a + D[k]().filter(x => x.sample).length, 0);
+const loaded = () => PBStore.status().loaded;
+function keepInputs(root, fn) {
+  const vals = {}; $$('input,textarea', root).forEach(i => { if (i.id) vals[i.id] = i.value; });
+  const a = document.activeElement; const aid = a && root.contains(a) ? a.id : null;
+  let sel = null; try { if (aid && a.selectionStart != null) sel = [a.selectionStart, a.selectionEnd]; } catch (e) {}
+  fn();
+  for (const [id, v] of Object.entries(vals)) { const el = document.getElementById(id); if (el && root.contains(el)) el.value = v; }
+  if (aid) { const el = document.getElementById(aid); if (el) { el.focus(); if (sel) try { el.setSelectionRange(sel[0], sel[1]); } catch (e) {} } }
+}
+
+/* ---------- 共用片段 ---------- */
+const vendorName = o => { const v = vById.get(o.vendorId); return v ? v.name : (o.vendorName || '未指定廠商'); };
+const vName = id => { const v = vById.get(id); return v ? v.name : '（已刪除的廠商）'; };
+const isOverdue = o => !!o.needBy && o.needBy < today() && !['received', 'cancelled'].includes(o.progress);
+const seal = (t, d, cls) => `<span class="seal ${cls || ''}" role="img" aria-label="${esc(t)}${d ? ' ' + esc(md(d)) : ''}"><b>${esc(t)}</b>${d ? `<i>${esc(md(d))}</i>` : ''}</span>`;
+const chip = o => `<span class="chip ${esc(o.approval)}">${esc(APPR[o.approval] || o.approval || '')}</span>`;
+const sampleTag = x => x.sample ? '<span class="tag-sample">範例</span>' : '';
+const loadingBox = what => `<div class="empty"><h3>正在讀取${what}…</h3><p>第一次開啟要從雲端下載資料，可能需要幾秒鐘。</p></div>`;
+
+/* ---------- 叫貨進度 ---------- */
+function ordersInScope() {
+  let list = D.orders().filter(o => o.progress !== 'cancelled');
+  if (S.flag) {
+    list = list.filter(o => o.progress !== 'received');
+    if (S.flag === 'overdue') list = list.filter(isOverdue);
+    if (S.flag === 'toorder') list = list.filter(o => o.progress === 'todo' && o.approval === 'approved');
+    if (S.flag === 'transit') list = list.filter(o => o.progress === 'ordered' || o.progress === 'partial');
+  } else if (S.scope === 'day') list = list.filter(o => o.date === S.day);
+  else if (S.scope === 'open') list = list.filter(o => o.progress !== 'received');
+  if (S.q) {
+    const q = S.q.toLowerCase();
+    list = list.filter(o => [o.no, o.item, o.spec, vendorName(o), o.requester, o.note].some(x => String(x || '').toLowerCase().includes(q)));
+  }
+  return list;
+}
+function renderOrders() {
+  $('#day').value = S.day;
+  $('#dayinfo').textContent = (S.day === today() ? '今天 · ' : '') + wk(S.day);
+  $('#todayBtn').hidden = S.day === today();
+  $$('[data-scope]').forEach(b => b.setAttribute('aria-pressed', String(!S.flag && b.dataset.scope === S.scope)));
+  renderKpis();
+  const orders = D.orders();
+  const hint = $('#hintbar'), board = $('#board'), note = $('#boardNote');
+  if (!orders.length) {
+    hint.innerHTML = ''; note.textContent = '';
+    board.style.display = 'block';
+    board.innerHTML = !loaded() ? loadingBox('叫貨資料') : `<div class="empty">
+        <h3>還沒有任何叫貨單</h3>
+        <p>按「新增叫貨」建立第一張叫貨單。送出後會進入簽核：主管簽核 → 經理核准，核准後就能標記已叫貨、登記到貨，每天的進度都會排在這個看板上。</p>
+        <div class="row">${can('order') ? '<button class="btn primary" type="button" data-new-order>＋ 新增叫貨</button>' : ''}${isAdmin() ? '<button class="btn" type="button" data-sample>載入範例資料</button>' : ''}</div>
+        ${isAdmin() ? '<p class="small">範例資料都會標上「範例」，之後可以一鍵清除。</p>' : ''}
+      </div>`;
+    return;
+  }
+  board.style.display = '';
+  const flagLabel = { overdue: '逾期未到貨', toorder: '已核准待叫貨', transit: '在途' }[S.flag];
+  if (S.flag) hint.innerHTML = `篩選中 <span class="fchip">${flagLabel}<button type="button" data-clear-flag aria-label="清除篩選">×</button></span>`;
+  else if (S.scope === 'day' && !orders.some(o => o.date === S.day && o.progress !== 'cancelled')) {
+    hint.innerHTML = `${md(S.day)} 還沒有叫貨單。${can('order') ? '<button class="btn sm" type="button" data-new-order>＋ 新增叫貨</button>' : ''}<button class="btn sm" type="button" data-scope="open">看所有未結案</button>`;
+  } else hint.innerHTML = '';
+
+  const list = ordersInScope();
+  const by = { todo: [], ordered: [], partial: [], received: [] };
+  for (const o of list) (by[o.progress] || by.todo).push(o);
+  const sortFn = (a, b) => (isOverdue(b) - isOverdue(a)) || cmpZh(a.needBy || '9999', b.needBy || '9999') || cmpZh(a.no, b.no);
+  board.innerHTML = PROGRESS.map(p => {
+    const arr = by[p.k].sort(sortFn);
+    return `<section class="col col-${p.k}" aria-label="${p.label}">
+      <header><span class="dot" aria-hidden="true"></span><h3>${p.label}</h3><span class="n">${arr.length}</span></header>
+      <div class="cards">${arr.map(card).join('') || '<p class="col-empty">沒有單據</p>'}</div>
+    </section>`;
+  }).join('');
+  const cancelled = orders.filter(o => o.progress === 'cancelled' && (S.scope !== 'day' || o.date === S.day)).length;
+  note.textContent = cancelled ? `另有 ${cancelled} 筆已取消，不顯示在看板上（可用搜尋找到後點開恢復）。` : '';
+}
+function renderKpis() {
+  const live = D.orders().filter(o => o.progress !== 'cancelled');
+  const day = live.filter(o => o.date === S.day);
+  const dayAmt = day.reduce((a, o) => a + num(o.amount), 0);
+  const pend = live.filter(o => o.approval === 'l1' || o.approval === 'l2');
+  const l1 = pend.filter(o => o.approval === 'l1').length;
+  const toOrder = live.filter(o => o.progress === 'todo' && o.approval === 'approved').length;
+  const transit = live.filter(o => o.progress === 'ordered' || o.progress === 'partial').length;
+  const over = live.filter(isOverdue).length;
+  const tiles = [
+    { k: 'day', label: (S.day === today() ? '今日' : md(S.day) + ' ') + '叫貨', val: day.length, sub: money(dayAmt), on: !S.flag && S.scope === 'day' },
+    { k: 'appr', label: '待簽核', val: pend.length, sub: `主管 ${l1} · 經理 ${pend.length - l1}`, tone: pend.length ? 'warn' : '' },
+    { k: 'toorder', label: '已核准待叫貨', val: toOrder, sub: toOrder ? '可以向廠商下單' : '沒有待下單', tone: toOrder ? 'accent' : '', on: S.flag === 'toorder' },
+    { k: 'transit', label: '在途', val: transit, sub: '已叫貨、未全數到貨', on: S.flag === 'transit' },
+    { k: 'overdue', label: '逾期未到貨', val: over, sub: '超過需求日期', tone: over ? 'bad' : '', on: S.flag === 'overdue' },
+  ];
+  $('#kpis').innerHTML = tiles.map(t => `<button type="button" class="kpi ${t.tone || ''}${t.on ? ' on' : ''}" data-kpi="${t.k}">
+    <span class="k-label">${esc(t.label)}</span><span class="k-val">${t.val}<small>筆</small></span><span class="k-sub">${esc(t.sub)}</span></button>`).join('');
+}
+function dueText(o) {
+  if (o.progress === 'received') return `已到貨 ${md(isoDay(o.receivedAt))}`;
+  const parts = [];
+  if (o.progress === 'partial') parts.push(`到貨 ${qtyf(o.receivedQty)}/${qtyf(o.qty)}`);
+  if (o.needBy) parts.push(isOverdue(o) ? `逾期 ${daysBetween(o.needBy, today())} 天 · 需求 ${md(o.needBy)}` : `需求 ${md(o.needBy)}`);
+  else parts.push('未填需求日');
+  return parts.join(' · ');
+}
+function advanceOf(o) {
+  if (!can('order')) return null;
+  if (o.progress === 'todo' && o.approval === 'approved') return { label: '標記已叫貨', act: 'ordered' };
+  if (o.progress === 'ordered' || o.progress === 'partial') return { label: '全部到貨', act: 'receive-all' };
+  return null;
+}
+function card(o) {
+  const over = isOverdue(o), adv = advanceOf(o), sealed = o.approval === 'approved', id = esc(o.id);
+  return `<article class="card${over ? ' is-over' : ''}${sealed ? ' sealed' : ''}" data-open="${id}">
+    <div class="card-top"><span class="po">${esc(o.no || '')}</span>${sampleTag(o)}${sealed ? '' : chip(o)}</div>
+    <button type="button" class="card-title" data-open="${id}">${esc(o.item)}${o.spec ? ` <span class="spec">${esc(o.spec)}</span>` : ''}</button>
+    <div class="card-meta"><span class="qty">${qtyf(o.qty)} ${esc(o.unit || '')}</span><span>${esc(vendorName(o))}</span>${S.scope !== 'day' || S.flag ? `<span>${md(o.date)} 叫貨</span>` : ''}</div>
+    <div class="card-foot"><span class="due${over ? ' over' : ''}">${esc(dueText(o))}</span>${adv ? `<button type="button" class="adv" data-act="${adv.act}" data-id="${id}">${adv.label}</button>` : ''}</div>
+    ${sealed ? `<span class="card-seal">${seal('核准', isoDay(o.approvedAt), 'sm')}</span>` : ''}
+  </article>`;
+}
+function exportCsv() {
+  const list = ordersInScope().slice().sort((a, b) => cmpZh(a.no, b.no));
+  if (!list.length) return toast('目前看板上沒有單據可以匯出。');
+  const cell = c => {
+    let s = String(c ?? '');
+    if (/^[=+@]/.test(s) || /^-[^\d]/.test(s)) s = "'" + s; // 避免 Excel 把內容當公式
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const head = ['單號', '叫貨日期', '品名', '規格', '數量', '單位', '廠商', '單價', '金額', '需求日期', '申請人', '簽核', '進度', '已到貨', '備註'];
+  const rows = list.map(o => [o.no, o.date, o.item, o.spec, o.qty, o.unit, vendorName(o), o.price, o.amount, o.needBy, o.requester, APPR[o.approval] || o.approval, PROG_LABEL[o.progress] || o.progress, o.receivedQty || 0, o.note]);
+  const csv = '﻿' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
+  const name = S.flag ? { overdue: '逾期未到貨', toorder: '待叫貨', transit: '在途' }[S.flag] : S.scope === 'day' ? S.day : S.scope === 'open' ? '未結案' : '全部';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = `叫貨單_${name}.csv`;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+  toast(`已匯出 ${list.length} 筆。`);
+}
+
+/* ---------- 簽核 ---------- */
+function renderApprovals() {
+  const live = D.orders().filter(o => o.progress !== 'cancelled');
+  const bySub = (a, b) => cmpZh(a.submittedAt || a.createdAt, b.submittedAt || b.createdAt);
+  const g = k => live.filter(o => o.approval === k).sort(bySub);
+  const l1 = g('l1'), l2 = g('l2'), rej = g('rejected'), draft = g('draft');
+  const toOrder = live.filter(o => o.approval === 'approved' && o.progress === 'todo').length;
+  const weekAgo = addDays(today(), -7);
+  const recent = live.filter(o => o.approval === 'approved' && isoDay(o.approvedAt) >= weekAgo).sort((a, b) => cmpZh(b.approvedAt, a.approvedAt)).slice(0, 20);
+  $('#apprFlow').innerHTML = [
+    { n: '1', l: '申請人送簽', v: draft.length, s: '草稿未送出' },
+    { n: '2', l: '主管簽核', v: l1.length, s: '待處理', hot: l1.length },
+    { n: '3', l: '經理核准', v: l2.length, s: '待處理', hot: l2.length },
+    { n: '4', l: '採購叫貨', v: toOrder, s: '已核准待下單', go: toOrder },
+  ].map(s => `<div class="st${s.hot ? ' hot' : ''}${s.go ? ' go' : ''}"><span class="st-n">步驟 ${s.n}</span><span class="st-l">${s.l}</span><span class="st-v">${s.v}</span><span class="k-sub">${s.s}</span></div>`).join('');
+  const root = $('#apprList');
+  if (!D.orders().length) {
+    root.innerHTML = !loaded() ? loadingBox('簽核資料') : `<div class="empty"><h3>還沒有需要簽核的單據</h3><p>新增叫貨單並按「送出簽核」後，會先出現在「待主管簽核」，主管核准後轉給經理，經理核准就能叫貨。</p>${can('order') ? '<div class="row"><button class="btn primary" type="button" data-new-order>＋ 新增叫貨</button></div>' : ''}</div>`;
+    return;
+  }
+  const sec = (title, arr, kind, emptyText) => (arr.length || emptyText) ? `<section class="asec"><h3>${title} <span class="n">${arr.length}</span></h3>
+    <div class="arows">${arr.map(o => arow(o, kind)).join('') || `<p class="empty-row">${emptyText}</p>`}</div></section>` : '';
+  keepInputs(root, () => {
+    root.innerHTML =
+      sec('待主管簽核', l1, 'l1', '目前沒有待主管簽核的單據。') +
+      sec('待經理核准', l2, 'l2', '目前沒有待經理核准的單據。') +
+      sec('退回待修改', rej, 'rejected', '') +
+      sec('草稿（尚未送簽）', draft, 'draft', '') +
+      sec('近 7 天已核准', recent, 'approved', '');
+  });
+}
+function arow(o, kind) {
+  const id = esc(o.id);
+  const waitDays = o.submittedAt ? daysBetween(isoDay(o.submittedAt), today()) : 0;
+  let act = '';
+  if (kind === 'l1' || kind === 'l2') {
+    act = canApprove(o)
+      ? `<input id="note-${id}" placeholder="簽核意見（退回必填）" aria-label="簽核意見"><button class="btn primary sm" type="button" data-act="approve" data-id="${id}" data-note="note-${id}">${kind === 'l1' ? '主管核准' : '經理核准'}</button><button class="btn sm danger" type="button" data-act="reject" data-id="${id}" data-note="note-${id}">退回</button>`
+      : `<span class="hint">等待${kind === 'l1' ? '主管' : '經理'}簽核</span>`;
+  } else if (kind === 'rejected' && can('order')) act = `<button class="btn sm" type="button" data-act="edit" data-id="${id}">修改</button><button class="btn sm primary" type="button" data-act="resubmit" data-id="${id}">重新送簽</button>`;
+  else if (kind === 'draft' && can('order')) act = `<button class="btn sm primary" type="button" data-act="submit" data-id="${id}">送出簽核</button>`;
+  else if (kind === 'approved') act = seal('核准', isoDay(o.approvedAt), 'sm');
+  const waiting = (kind === 'l1' || kind === 'l2') && o.submittedAt
+    ? `<span class="${waitDays >= 1 ? 'wait' : ''}">送簽 ${esc(stamp(o.submittedAt))}${waitDays >= 1 ? ` · 已等 ${waitDays} 天` : ''}</span>` : '';
+  return `<div class="arow">
+    <div class="arow-main">
+      <div class="meta-line"><span class="po">${esc(o.no)}</span>${sampleTag(o)}${o.requester ? `<span>${esc(o.requester)}</span>` : ''}${waiting}</div>
+      <button type="button" class="card-title" data-open="${id}">${esc(o.item)}${o.spec ? ` <span class="spec">${esc(o.spec)}</span>` : ''}</button>
+      <div class="card-meta"><span class="qty">${qtyf(o.qty)} ${esc(o.unit || '')}</span><span>${esc(vendorName(o))}</span><span class="amt">${money(o.amount)}</span>${o.needBy ? `<span>需求 ${md(o.needBy)}</span>` : ''}</div>
+      ${kind === 'rejected' ? `<div class="reason">退回原因：${esc(o.rejectNote || '未填寫')}</div>` : ''}
+    </div>
+    ${act ? `<div class="arow-act">${act}</div>` : ''}
+  </div>`;
+}
+
+/* ---------- 廠商產品查詢 ---------- */
+function renderVendors() {
+  const vendors = D.vendors(), products = D.products();
+  const vs = [...vendors].sort((a, b) => cmpZh(a.name, b.name));
+  const sel = $('#pvendor');
+  if (S.pvendor && !vById.has(S.pvendor)) S.pvendor = '';
+  const opts = `<option value="">全部廠商</option>` + vs.map(v => `<option value="${esc(v.id)}">${esc(v.name)}</option>`).join('');
+  if (sel.dataset.h !== opts) { sel.innerHTML = opts; sel.dataset.h = opts; }
+  sel.value = S.pvendor;
+  const cats = [...new Set(products.map(p => p.category).filter(Boolean))].sort(cmpZh);
+  if (S.pcat && !cats.includes(S.pcat)) S.pcat = '';
+  $('#cats').innerHTML = cats.length > 1 ? `<button type="button" class="chipbtn${!S.pcat ? ' on' : ''}" data-cat="">全部分類</button>` +
+    cats.map(c => `<button type="button" class="chipbtn${S.pcat === c ? ' on' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('') : '';
+  const counts = {}; for (const p of products) counts[p.vendorId] = (counts[p.vendorId] || 0) + 1;
+  $('#vcount').textContent = vs.length ? vs.length + ' 家' : '';
+  $('#vlist').innerHTML = vs.length ? vs.map(v => `<button type="button" class="vitem${S.pvendor === v.id ? ' on' : ''}" data-vendor="${esc(v.id)}">
+      <span class="vname">${esc(v.name)} ${sampleTag(v)}</span><span class="vcount">${counts[v.id] || 0} 項</span>
+      <span class="vmeta">${esc([v.category, v.contact].filter(Boolean).join(' · ') || '—')}</span></button>`).join('')
+    : `<p class="col-empty">還沒有廠商。</p>`;
+  const out = $('#presults');
+  if (!products.length && !vendors.length) {
+    out.innerHTML = !loaded() ? loadingBox('廠商資料') : `<div class="empty"><h3>還沒有廠商產品資料</h3>
+      <p>先建立廠商，再登錄每家可以提供的產品、單價、最小訂量和交期。已經有 Excel 價目表的話，直接複製表格貼上就能一次匯入。</p>
+      <div class="row">${can('vendor') ? '<button class="btn primary" type="button" data-import>從 Excel 貼上匯入</button><button class="btn" type="button" data-add-vendor>新增廠商</button>' : ''}${isAdmin() ? '<button class="btn" type="button" data-sample>載入範例資料</button>' : ''}</div></div>`;
+    return;
+  }
+  let head = '';
+  if (S.pvendor) {
+    const v = vById.get(S.pvendor);
+    const f = (k, val) => val ? `<div><dt>${k}</dt><dd>${esc(val)}</dd></div>` : '';
+    head = `<div class="vhead"><div class="vhead-top"><h3>${esc(v.name)}</h3>${sampleTag(v)}
+      ${can('vendor') ? `<button class="btn sm" type="button" data-edit-vendor="${esc(v.id)}">編輯廠商</button>` : ''}<button class="btn sm ghost" type="button" data-vendor="">看全部廠商</button></div>
+      <dl>${f('主要品類', v.category)}${f('聯絡人', v.contact)}${f('電話', v.phone)}${f('Email', v.email)}${f('付款條件', v.terms)}${v.leadDays ? f('平均交期', v.leadDays + ' 天') : ''}${f('備註', v.note)}</dl></div>`;
+  }
+  let list = products;
+  if (S.pvendor) list = list.filter(p => p.vendorId === S.pvendor);
+  if (S.pcat) list = list.filter(p => p.category === S.pcat);
+  if (S.pq) {
+    const q = S.pq.toLowerCase();
+    list = list.filter(p => [p.name, p.spec, p.category, vName(p.vendorId)].some(x => String(x || '').toLowerCase().includes(q)));
+  }
+  const groups = new Map();
+  for (const p of list) { const k = (p.name || '').trim(); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(p); }
+  const keys = [...groups.keys()].sort(cmpZh);
+  let body;
+  if (!keys.length) {
+    body = S.pq ? `<div class="empty"><h3>找不到「${esc(S.pq)}」</h3><p>試試比較短的關鍵字，例如只打「螺絲」或「紙箱」，或換個分類、改成全部廠商。</p></div>`
+      : `<div class="empty"><h3>這個條件下還沒有產品</h3><p>${S.pvendor ? '這家廠商還沒登錄產品。' : ''}${can('vendor') ? '可以按「新增產品」加入。' : ''}</p>${can('vendor') ? '<div class="row"><button class="btn" type="button" data-add-product>新增產品</button></div>' : ''}</div>`;
+  } else {
+    const showActs = can('order') || can('vendor');
+    body = `<p class="pcount">${keys.length} 種產品 · ${list.length} 筆報價${S.pq ? `（搜尋「${esc(S.pq)}」）` : ''}</p>` + keys.map(k => {
+      const arr = groups.get(k).sort((a, b) => num(a.price) - num(b.price));
+      const vcount = new Set(arr.map(p => p.vendorId)).size;
+      const min = arr[0];
+      return `<div class="pgroup"><div class="pg-head"><h4>${esc(k)}</h4><span class="pg-sum">${vcount} 家供應${vcount > 1 ? ` · 最低 ${price(min.price)}／${esc(min.unit || '')}（${esc(vName(min.vendorId))}）` : ''}</span></div>
+        <div class="tscroll"><table class="pt"><thead><tr><th>廠商</th><th>規格</th><th class="r">單價</th><th class="r">最小訂量</th><th class="r">交期</th>${showActs ? '<th class="r"><span class="muted">操作</span></th>' : ''}</tr></thead><tbody>
+        ${arr.map((p, i) => `<tr>
+          <td><button type="button" class="link" data-vendor="${esc(p.vendorId)}">${esc(vName(p.vendorId))}</button> ${sampleTag(p)}</td>
+          <td>${esc(p.spec || '—')}${p.category ? ` <span class="muted">· ${esc(p.category)}</span>` : ''}</td>
+          <td class="r num">${price(p.price)}<small>／${esc(p.unit || '')}</small>${i === 0 && arr.length > 1 && num(p.price) < num(arr[arr.length - 1].price) ? '<span class="best">最低</span>' : ''}</td>
+          <td class="r num">${p.moq ? qtyf(p.moq) + ' <small>' + esc(p.unit || '') + '</small>' : '—'}</td>
+          <td class="r num">${p.leadDays ? qtyf(p.leadDays) + ' <small>天</small>' : '—'}</td>
+          ${showActs ? `<td class="r"><span class="acts">${can('order') ? `<button class="btn sm" type="button" data-order-product="${esc(p.id)}">叫貨</button>` : ''}${can('vendor') ? `<button class="icon-btn sm" type="button" data-edit-product="${esc(p.id)}" aria-label="編輯 ${esc(p.name)}">✎</button>` : ''}</span></td>` : ''}
+        </tr>`).join('')}</tbody></table></div></div>`;
+    }).join('');
+  }
+  out.innerHTML = head + body;
+}
+
+/* ---------- 對話框 ---------- */
+const dlg = $('#dlg');
+function openDialog(html, mount) { S.detailId = null; dlg.innerHTML = html; if (!dlg.open) dlg.showModal(); if (mount) mount(); const first = dlg.querySelector('[autofocus]'); if (first) first.focus(); }
+function closeDialog() { if (dlg.open) dlg.close(); }
+dlg.addEventListener('close', () => { S.detailId = null; dlg.innerHTML = ''; });
+dlg.addEventListener('click', e => { if (e.target === dlg) closeDialog(); });
+function openDetail(id) { S.detailId = id; dlg.innerHTML = detailHtml(id); if (!dlg.open) dlg.showModal(); }
+
+function lifecycle(o) {
+  const ap = o.approval, pg = o.progress;
+  const steps = [{ l: '建單', d: stamp(o.createdAt), c: 'done' }];
+  if (ap === 'approved') steps.push({ l: '核准', d: stamp(o.approvedAt), c: 'done' });
+  else if (ap === 'rejected') steps.push({ l: '退回', d: '待修改', c: 'bad' });
+  else steps.push({ l: '簽核', d: ap === 'l1' ? '主管簽核中' : ap === 'l2' ? '經理核准中' : '尚未送出', c: 'cur' });
+  const ordered = ['ordered', 'partial', 'received'].includes(pg);
+  steps.push(ordered ? { l: '叫貨', d: stamp(o.orderedAt), c: 'done' } : { l: '叫貨', d: ap === 'approved' ? '可以下單' : '核准後', c: ap === 'approved' ? 'cur' : '' });
+  if (pg === 'received') steps.push({ l: '到貨', d: stamp(o.receivedAt), c: 'done' });
+  else if (pg === 'partial') steps.push({ l: '到貨', d: `已到 ${qtyf(o.receivedQty)}/${qtyf(o.qty)}`, c: 'cur' });
+  else steps.push({ l: '到貨', d: o.needBy ? '需求 ' + md(o.needBy) : '—', c: pg === 'ordered' ? 'cur' : '' });
+  return steps.map(s => `<li class="${s.c}"><span class="s-l">${s.l}</span><span class="s-d">${esc(s.d || '—')}</span></li>`).join('');
+}
+function nextBlock(o) {
+  const id = esc(o.id);
+  const blk = (title, body, btns) => `<div class="next"><h3>${title}</h3>${body || ''}${btns ? `<div class="row">${btns}</div>` : ''}</div>`;
+  const ord = can('order');
+  if (o.progress === 'cancelled') return blk('此單已取消', '<p class="hint">已取消的單不會出現在看板上。</p>', ord ? `<button class="btn" type="button" data-act="restore" data-id="${id}">恢復此單</button>` : '');
+  if (o.approval === 'draft') return blk('下一步：送出簽核', '<p class="hint">草稿還沒進入簽核。確認內容後送出，主管會在「簽核」頁看到。</p>', ord ? `<button class="btn primary" type="button" data-act="submit" data-id="${id}">送出簽核</button><button class="btn" type="button" data-act="edit" data-id="${id}">修改內容</button>` : '');
+  if (o.approval === 'rejected') return blk('已退回，需要修改', `<p class="reason">退回原因：${esc(o.rejectNote || '未填寫')}</p>`, ord ? `<button class="btn" type="button" data-act="edit" data-id="${id}">修改內容</button><button class="btn primary" type="button" data-act="resubmit" data-id="${id}">重新送簽</button>` : '');
+  if (o.approval === 'l1' || o.approval === 'l2') {
+    const r = o.approval === 'l1' ? '主管' : '經理';
+    if (!canApprove(o)) return blk(`等待${r}簽核`, `<p class="hint">你沒有${r}簽核的權限，等${r}處理即可。</p>`, '');
+    return blk(`等待${r}簽核`, `<input id="dnote" class="inp" placeholder="簽核意見（退回時必填）" aria-label="簽核意見">`,
+      `<button class="btn primary" type="button" data-act="approve" data-id="${id}" data-note="dnote">${r}核准</button><button class="btn danger" type="button" data-act="reject" data-id="${id}" data-note="dnote">退回</button>`);
+  }
+  if (!ord) return '';
+  if (o.progress === 'todo') {
+    const v = vById.get(o.vendorId);
+    return blk('已核准，可以叫貨', `<p class="hint">向${esc(vendorName(o))}下單${v && v.phone ? `（電話 <span class="mono">${esc(v.phone)}</span>）` : ''}後，按「標記已叫貨」。</p>`, `<button class="btn primary" type="button" data-act="ordered" data-id="${id}">標記已叫貨</button>`);
+  }
+  if (o.progress === 'ordered' || o.progress === 'partial') {
+    const left = Math.max(0, num(o.qty) - num(o.receivedQty));
+    return blk('等待到貨', `<label class="f inline" for="drecv">本次到貨數量<input id="drecv" type="number" min="0" step="any" inputmode="decimal" placeholder="${qtyf(left)}"> <span class="hint">${esc(o.unit || '')}，尚欠 ${qtyf(left)}</span></label>`,
+      `<button class="btn" type="button" data-act="receive" data-id="${id}">登記到貨</button><button class="btn primary" type="button" data-act="receive-all" data-id="${id}">全部到貨</button>`);
+  }
+  return blk(`已全部到貨 · ${md(isoDay(o.receivedAt))}`, '', `<button class="btn sm" type="button" data-act="unreceive" data-id="${id}" data-confirm="確定改回在途？">改回在途</button>`);
+}
+function histLi(h) {
+  let t;
+  switch (h.act) {
+    case 'create': t = '建立叫貨單'; break;
+    case 'submit': t = '送出簽核'; break;
+    case 'resubmit': t = '修改後重新送簽'; break;
+    case 'approve': t = (h.role || '') + '核准'; break;
+    case 'reject': t = (h.role || '') + '退回'; break;
+    case 'progress': t = '進度改為「' + (PROG_LABEL[h.to] || h.to) + '」' + (h.add ? `（本次到貨 ${qtyf(h.add)}）` : ''); break;
+    case 'edit': t = '修改內容'; break;
+    case 'cancel': t = '取消此單'; break;
+    case 'restore': t = '恢復此單'; break;
+    default: t = h.act || '';
+  }
+  return `<li><time>${esc(stamp(h.at))}</time><div><span>${esc(t)}</span>${h.by ? ` <span class="by">· ${esc(h.by)}</span>` : ''}${h.note ? `<div class="nt">「${esc(h.note)}」</div>` : ''}</div></li>`;
+}
+function detailHtml(id) {
+  const o = PBStore.get('orders', id);
+  if (!o) return `<div class="dlg"><div class="dlg-head"><div><h2>找不到這張叫貨單</h2><p class="hint">可能已經被刪除。</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div></div>`;
+  const v = vById.get(o.vendorId), over = isOverdue(o), cancelled = o.progress === 'cancelled', oid = esc(o.id);
+  const fact = (k, val) => `<div><dt>${k}</dt><dd>${val}</dd></div>`;
+  return `<div class="dlg">
+    <div class="dlg-head">
+      <div>
+        <div class="eyebrow"><span class="po">${esc(o.no)}</span>${sampleTag(o)}${cancelled ? '<span class="chip">已取消</span>' : chip(o)}</div>
+        <h2>${esc(o.item)}${o.spec ? ` <span class="spec">${esc(o.spec)}</span>` : ''}</h2>
+      </div>
+      ${o.approval === 'approved' ? seal('核准', isoDay(o.approvedAt), 'lg') : o.approval === 'rejected' ? seal('退回', '', 'lg') : ''}
+      <button type="button" class="icon-btn" data-close aria-label="關閉">×</button>
+    </div>
+    <div class="dlg-body">
+      <ol class="stepper" aria-label="流程">${lifecycle(o)}</ol>
+      ${nextBlock(o)}
+      <dl class="facts">
+        ${fact('數量', `<span class="num">${qtyf(o.qty)}</span> ${esc(o.unit || '')}`)}
+        ${fact('單價', o.price ? `<span class="num">${price(o.price)}</span>` : '—')}
+        ${fact('金額', `<span class="num">${money(o.amount)}</span>`)}
+        ${fact('廠商', esc(vendorName(o)))}
+        ${fact('廠商電話', v && v.phone ? `<span class="mono">${esc(v.phone)}</span>` : '—')}
+        ${fact('申請人／部門', esc(o.requester || '—'))}
+        ${fact('叫貨日期', o.date ? `${md(o.date)} ${wk(o.date)}` : '—')}
+        ${fact('需求日期', o.needBy ? `<span class="${over ? 'bad-t' : ''}">${md(o.needBy)} ${wk(o.needBy)}${over ? ` · 逾期 ${daysBetween(o.needBy, today())} 天` : ''}</span>` : '—')}
+        ${fact('已到貨', `<span class="num">${qtyf(o.receivedQty || 0)} / ${qtyf(o.qty)}</span> ${esc(o.unit || '')}`)}
+        ${o.note ? `<div class="span-all"><dt>備註</dt><dd>${esc(o.note)}</dd></div>` : ''}
+      </dl>
+      <section><h3 class="sub-h">紀錄</h3><ol class="timeline">${(o.history || []).slice().reverse().map(histLi).join('')}</ol></section>
+    </div>
+    <div class="dlg-foot">
+      ${can('order') ? `<div class="left">
+        <button class="btn sm danger" type="button" data-act="delete" data-id="${oid}" data-confirm="確定刪除？無法復原">刪除</button>
+        ${!cancelled && o.progress !== 'received' ? `<button class="btn sm" type="button" data-act="cancel" data-id="${oid}" data-confirm="確定取消此單？">取消此單</button>` : ''}
+      </div><button class="btn" type="button" data-act="edit" data-id="${oid}">修改</button>` : ''}
+      <button class="btn primary" type="button" data-close>完成</button>
+    </div>
+  </div>`;
+}
+
+/* ---------- 叫貨單表單 ---------- */
+function nextNo(date) {
+  const pre = 'PO' + String(date).replace(/-/g, '');
+  let max = 0;
+  for (const o of D.orders()) if ((o.no || '').startsWith(pre + '-')) max = Math.max(max, parseInt(o.no.slice(pre.length + 1), 10) || 0);
+  return pre + '-' + String(max + 1).padStart(3, '0');
+}
+function openOrderForm(o, pre) {
+  if (!can('order')) return toast('你沒有叫貨的權限。');
+  pre = pre || {};
+  const v = o || pre, isEdit = !!o;
+  const names = [...new Set(D.products().map(p => p.name))].sort(cmpZh);
+  const vs = [...D.vendors()].sort((a, b) => cmpZh(a.name, b.name));
+  const date = (o && o.date) || pre.date || (S.view === 'orders' ? S.day : today());
+  const reapprove = isEdit && o.progress === 'todo' && ['l1', 'l2', 'approved'].includes(o.approval);
+  const canSubmit = !isEdit || ['draft', 'rejected'].includes(o.approval);
+  const html = `<form id="orderForm" class="dlg" novalidate>
+    <div class="dlg-head"><div><div class="eyebrow"><span class="po">${isEdit ? esc(o.no) : '新叫貨單'}</span></div><h2>${isEdit ? '修改叫貨單' : '新增叫貨'}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body form-grid">
+      <label class="f span2" for="f-item"><span class="req">品名</span><input id="f-item" list="dl-products" autocomplete="off" value="${esc(v.item || '')}" placeholder="例如：不鏽鋼螺絲" ${isEdit ? '' : 'autofocus'}></label>
+      <datalist id="dl-products">${names.map(n => `<option value="${esc(n)}"></option>`).join('')}</datalist>
+      <div id="f-offers" class="offers span2"></div>
+      <label class="f span2" for="f-spec">規格<input id="f-spec" value="${esc(v.spec || '')}" placeholder="尺寸、材質、型號"></label>
+      <label class="f" for="f-qty"><span class="req">數量</span><input id="f-qty" type="number" min="0" step="any" inputmode="decimal" value="${esc(v.qty ?? '')}"></label>
+      <label class="f" for="f-unit">單位<input id="f-unit" value="${esc(v.unit || '')}" placeholder="個、支、箱"></label>
+      <label class="f span2" for="f-vendor">廠商<select id="f-vendor"><option value="">（未指定）</option>${vs.map(x => `<option value="${esc(x.id)}"${x.id === v.vendorId ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
+      <label class="f" for="f-price">單價（NT$）<input id="f-price" type="number" min="0" step="any" inputmode="decimal" value="${esc(v.price ?? '')}"></label>
+      <div class="f">金額<output id="f-amount">NT$0</output></div>
+      <label class="f" for="f-date">叫貨日期<input id="f-date" type="date" value="${esc(date)}"></label>
+      <label class="f" for="f-need">需求日期<input id="f-need" type="date" value="${esc(v.needBy || '')}"></label>
+      <label class="f span2" for="f-req">申請人／部門<input id="f-req" value="${esc(v.requester ?? myName())}" placeholder="例如：生產課 王小明"></label>
+      <label class="f span2" for="f-note">備註<textarea id="f-note" rows="2">${esc(v.note || '')}</textarea></label>
+      ${reapprove ? '<p class="hint span2">修改品名、規格、數量、單價或廠商後，會退回重新簽核。</p>' : ''}
+      <p id="f-err" class="err span2" hidden></p>
+    </div>
+    <div class="dlg-foot">
+      <button type="button" class="btn ghost" data-close>取消</button>
+      ${isEdit ? `<button type="submit" class="btn${canSubmit ? '' : ' primary'}" value="save">儲存</button>` : '<button type="submit" class="btn" value="draft">存草稿</button>'}
+      ${canSubmit ? `<button type="submit" class="btn primary" value="submit">${isEdit ? '儲存並送簽' : '送出簽核'}</button>` : ''}
+    </div>
+  </form>`;
+  openDialog(html, () => mountOrderForm(o));
+}
+function mountOrderForm(o) {
+  const item = $('#f-item'), vendor = $('#f-vendor'), priceI = $('#f-price'), qty = $('#f-qty'), unit = $('#f-unit'), spec = $('#f-spec');
+  const upd2 = () => { $('#f-amount').textContent = money(num(qty.value) * num(priceI.value)); };
+  const offers = () => {
+    const name = item.value.trim();
+    const list = D.products().filter(p => p.name === name).sort((a, b) => num(a.price) - num(b.price));
+    $('#f-offers').innerHTML = list.length
+      ? `<div class="offers-h">${new Set(list.map(p => p.vendorId)).size} 家廠商有這項產品，點一下帶入廠商、規格和單價：</div>` +
+        list.map((p, i) => `<button type="button" class="offer${vendor.value === p.vendorId && (spec.value || '') === (p.spec || '') ? ' on' : ''}" data-pick="${esc(p.id)}"><b>${esc(vName(p.vendorId))}</b><span>${esc(p.spec || '')}</span><span class="num">${price(p.price)}／${esc(p.unit || '')}</span>${i === 0 && list.length > 1 ? '<em>最低</em>' : ''}</button>`).join('')
+      : (name && D.products().length ? '<div class="offers-h">目前沒有廠商登錄這項產品，可以直接填寫。</div>' : '');
+  };
+  item.addEventListener('input', offers);
+  spec.addEventListener('input', offers);
+  vendor.addEventListener('change', () => {
+    const p = D.products().find(x => x.name === item.value.trim() && x.vendorId === vendor.value);
+    if (p) { priceI.value = p.price ?? ''; if (!unit.value) unit.value = p.unit || ''; if (!spec.value) spec.value = p.spec || ''; upd2(); }
+    offers();
+  });
+  qty.addEventListener('input', upd2); priceI.addEventListener('input', upd2);
+  $('#f-offers').addEventListener('click', e => {
+    const b = e.target.closest('[data-pick]'); if (!b) return;
+    const p = PBStore.get('products', b.dataset.pick); if (!p) return;
+    vendor.value = p.vendorId; priceI.value = p.price ?? ''; unit.value = p.unit || ''; spec.value = p.spec || '';
+    if (!qty.value && p.moq) qty.value = p.moq;
+    if (!$('#f-need').value && p.leadDays) $('#f-need').value = addDays($('#f-date').value || today(), num(p.leadDays));
+    upd2(); offers();
+  });
+  offers(); upd2();
+  $('#orderForm').addEventListener('submit', e => { e.preventDefault(); saveOrder(o, (e.submitter && e.submitter.value) || 'save'); });
+}
+function saveOrder(o, mode) {
+  const g = id => $('#' + id).value.trim();
+  const err = $('#f-err');
+  const fail = (msg, id) => { err.textContent = msg; err.hidden = false; if (id) $('#' + id).focus(); };
+  const item = g('f-item'), qty = num(g('f-qty'));
+  if (!item) return fail('請填寫品名。', 'f-item');
+  if (!(qty > 0)) return fail('數量要大於 0。', 'f-qty');
+  const vendorId = g('f-vendor'), v = vById.get(vendorId), p = num(g('f-price'));
+  const t = nowIso(), me = myName();
+  const data = {
+    item, spec: g('f-spec'), qty, unit: g('f-unit'), vendorId, vendorName: v ? v.name : '',
+    price: p, amount: Math.round(qty * p * 100) / 100, date: g('f-date') || S.day, needBy: g('f-need'),
+    requester: g('f-req'), note: g('f-note'), updatedAt: t,
+  };
+  if (!o) {
+    const submit = mode === 'submit';
+    const doc = {
+      id: rid(), ...data, no: nextNo(data.date), progress: 'todo', approval: submit ? 'l1' : 'draft', receivedQty: 0,
+      createdBy: me, createdAt: t, submittedAt: submit ? t : null, approvedAt: null, orderedAt: null, receivedAt: null, rejectNote: '',
+      history: [{ id: rid(), act: 'create', by: me, at: t }].concat(submit ? [{ id: rid(), act: 'submit', by: me, at: t, role: '申請人' }] : []),
+    };
+    closeDialog();
+    if (S.view === 'orders' && !S.flag && S.scope === 'day' && data.date !== S.day) S.day = data.date;
+    PBStore.save('orders', doc);
+    toast(submit ? `${doc.no} 已送出簽核` : `${doc.no} 已存成草稿`);
+    return;
+  }
+  const cur = PBStore.get('orders', o.id) || o;
+  const keyChanged = ['item', 'spec', 'qty', 'price', 'vendorId'].some(k => String(cur[k] ?? '') !== String(data[k] ?? ''));
+  const patch = { ...data };
+  const hist = histAdd(cur, { act: 'edit' });
+  let msg = `${cur.no} 已更新`;
+  if (keyChanged && cur.progress === 'todo' && ['l1', 'l2', 'approved'].includes(cur.approval)) {
+    Object.assign(patch, { approval: 'l1', approvedAt: null, submittedAt: t });
+    hist.push({ id: rid(), act: 'resubmit', by: me, at: t, role: '申請人' }); msg += '，已重新送簽';
+  }
+  if (mode === 'submit' && ['draft', 'rejected'].includes(cur.approval)) {
+    Object.assign(patch, { approval: 'l1', submittedAt: t, rejectNote: '' });
+    hist.push({ id: rid(), act: cur.approval === 'rejected' ? 'resubmit' : 'submit', by: me, at: t, role: '申請人' }); msg = `${cur.no} 已送出簽核`;
+  }
+  patch.history = hist;
+  upd('orders', cur.id, patch, msg);
+  openDetail(cur.id);
+}
+
+/* ---------- 叫貨單動作 ---------- */
+function noteVal(t) { const el = t.dataset.note && document.getElementById(t.dataset.note); return el ? el.value.trim() : ''; }
+function orderAct(act, o, t) {
+  if (!o) return toast('找不到這張叫貨單，可能已被別人刪除。');
+  const id = o.id, t0 = nowIso();
+  const needOrder = () => { if (!can('order')) { toast('你沒有叫貨的權限。'); return false; } return true; };
+  switch (act) {
+    case 'submit':
+    case 'resubmit':
+      if (!needOrder()) return;
+      return upd('orders', id, { approval: 'l1', submittedAt: t0, rejectNote: '', updatedAt: t0, history: histAdd(o, { act: o.approval === 'rejected' ? 'resubmit' : 'submit', role: '申請人' }) }, `${o.no} 已送出簽核`);
+    case 'approve': {
+      if (!canApprove(o)) return toast('你沒有這一關的簽核權限。');
+      const note = noteVal(t), final = o.approval === 'l2';
+      const patch = { approval: final ? 'approved' : 'l2', updatedAt: t0, history: histAdd(o, { act: 'approve', role: final ? '經理' : '主管', note }) };
+      if (final) patch.approvedAt = t0;
+      return upd('orders', id, patch, final ? `${o.no} 已核准，可以叫貨了` : `${o.no} 主管已核准，轉給經理`);
+    }
+    case 'reject': {
+      if (!canApprove(o)) return toast('你沒有這一關的簽核權限。');
+      const note = noteVal(t);
+      if (!note) { const el = document.getElementById(t.dataset.note); if (el) el.focus(); return toast('請填寫退回原因，讓申請人知道要改什麼。'); }
+      return upd('orders', id, { approval: 'rejected', rejectNote: note, updatedAt: t0, history: histAdd(o, { act: 'reject', role: o.approval === 'l1' ? '主管' : '經理', note }) }, `${o.no} 已退回`);
+    }
+    case 'ordered':
+      if (!needOrder()) return;
+      if (o.approval !== 'approved') return toast('這張單還沒核准，核准後才能叫貨。');
+      return upd('orders', id, { progress: 'ordered', orderedAt: o.orderedAt || t0, updatedAt: t0, history: histAdd(o, { act: 'progress', to: 'ordered' }) }, `${o.no} 已標記叫貨`);
+    case 'receive-all':
+      if (!needOrder()) return;
+      return upd('orders', id, { progress: 'received', receivedQty: num(o.qty), receivedAt: t0, updatedAt: t0, history: histAdd(o, { act: 'progress', to: 'received' }) }, `${o.no} 已全部到貨`);
+    case 'receive': {
+      if (!needOrder()) return;
+      const el = $('#drecv'), add = num(el && el.value);
+      if (!(add > 0)) { if (el) el.focus(); return toast('請輸入這次到貨的數量。'); }
+      const got = num(o.receivedQty) + add, done = got >= num(o.qty);
+      return upd('orders', id, { progress: done ? 'received' : 'partial', receivedQty: got, receivedAt: done ? t0 : null, updatedAt: t0, history: histAdd(o, { act: 'progress', to: done ? 'received' : 'partial', add }) },
+        done ? `${o.no} 已全部到貨` : `${o.no} 已登記到貨 ${qtyf(add)}，尚欠 ${qtyf(num(o.qty) - got)}`);
+    }
+    case 'unreceive':
+      if (!needOrder()) return;
+      return upd('orders', id, { progress: 'ordered', receivedQty: 0, receivedAt: null, updatedAt: t0, history: histAdd(o, { act: 'progress', to: 'ordered' }) }, `${o.no} 已改回在途`);
+    case 'cancel':
+      if (!needOrder()) return;
+      return upd('orders', id, { progress: 'cancelled', prevProgress: o.progress, updatedAt: t0, history: histAdd(o, { act: 'cancel' }) }, `${o.no} 已取消`);
+    case 'restore':
+      if (!needOrder()) return;
+      return upd('orders', id, { progress: o.prevProgress || 'todo', updatedAt: t0, history: histAdd(o, { act: 'restore' }) }, `${o.no} 已恢復`);
+    case 'edit':
+      return openOrderForm(o);
+    case 'delete':
+      if (!needOrder()) return;
+      closeDialog();
+      PBStore.remove('orders', id);
+      return toast(`${o.no} 已刪除`);
+  }
+}
+
+/* ---------- 廠商、產品表單 ---------- */
+function openVendorForm(v) {
+  if (!can('vendor')) return toast('你沒有維護廠商資料的權限。');
+  v = v || {};
+  const isEdit = !!v.id;
+  const pc = isEdit ? D.products().filter(p => p.vendorId === v.id).length : 0;
+  openDialog(`<form id="vendorForm" class="dlg" novalidate>
+    <div class="dlg-head"><div><h2>${isEdit ? '編輯廠商' : '新增廠商'}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body form-grid">
+      <label class="f span2" for="v-name"><span class="req">廠商名稱</span><input id="v-name" value="${esc(v.name || '')}" autofocus></label>
+      <label class="f" for="v-cat">主要品類<input id="v-cat" value="${esc(v.category || '')}" placeholder="五金、包材、電子零件"></label>
+      <label class="f" for="v-contact">聯絡人<input id="v-contact" value="${esc(v.contact || '')}"></label>
+      <label class="f" for="v-phone">電話<input id="v-phone" type="tel" value="${esc(v.phone || '')}"></label>
+      <label class="f" for="v-email">Email<input id="v-email" type="email" value="${esc(v.email || '')}"></label>
+      <label class="f" for="v-terms">付款條件<input id="v-terms" value="${esc(v.terms || '')}" placeholder="月結 30 天"></label>
+      <label class="f" for="v-lead">平均交期（天）<input id="v-lead" type="number" min="0" step="1" value="${esc(v.leadDays || '')}"></label>
+      <label class="f span2" for="v-note">備註<textarea id="v-note" rows="2">${esc(v.note || '')}</textarea></label>
+      <p id="v-err" class="err span2" hidden></p>
+    </div>
+    <div class="dlg-foot">
+      ${isEdit ? `<div class="left"><button class="btn sm danger" type="button" data-act="delete-vendor" data-id="${esc(v.id)}" data-confirm="${pc ? `連同 ${pc} 項產品一起刪除？` : '確定刪除？'}">刪除廠商</button></div>` : ''}
+      <button type="button" class="btn ghost" data-close>取消</button>
+      <button type="submit" class="btn primary">儲存</button>
+    </div></form>`, () => {
+    $('#vendorForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const g = id => $('#' + id).value.trim();
+      const name = g('v-name'), err = $('#v-err');
+      if (!name) { err.textContent = '請填寫廠商名稱。'; err.hidden = false; return $('#v-name').focus(); }
+      if (D.vendors().some(x => x.id !== v.id && x.name.trim() === name)) { err.textContent = '已經有同名的廠商。'; err.hidden = false; return; }
+      const data = { name, category: g('v-cat'), contact: g('v-contact'), phone: g('v-phone'), email: g('v-email'), terms: g('v-terms'), leadDays: num(g('v-lead')), note: g('v-note'), updatedAt: nowIso() };
+      closeDialog();
+      if (isEdit) upd('vendors', v.id, data, `已更新 ${name}`);
+      else { const id = rid(); S.pvendor = id; PBStore.save('vendors', { id, ...data, createdAt: nowIso() }); toast(`已新增 ${name}`); }
+    });
+  });
+}
+function openProductForm(p) {
+  if (!can('vendor')) return toast('你沒有維護產品資料的權限。');
+  p = p || {};
+  const isEdit = !!p.id;
+  const vs = [...D.vendors()].sort((a, b) => cmpZh(a.name, b.name));
+  if (!vs.length) { toast('請先新增廠商，再登錄產品。'); return openVendorForm(); }
+  const vid = p.vendorId || S.pvendor || '';
+  const cats = [...new Set(D.products().map(x => x.category).filter(Boolean))].sort(cmpZh);
+  openDialog(`<form id="productForm" class="dlg" novalidate>
+    <div class="dlg-head"><div><h2>${isEdit ? '編輯產品' : '新增產品'}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body form-grid">
+      <label class="f span2" for="p-vendor"><span class="req">廠商</span><select id="p-vendor"><option value="">請選擇</option>${vs.map(v => `<option value="${esc(v.id)}"${v.id === vid ? ' selected' : ''}>${esc(v.name)}</option>`).join('')}</select></label>
+      <label class="f span2" for="p-name"><span class="req">品名</span><input id="p-name" value="${esc(p.name || '')}" list="dl-pnames" autocomplete="off" autofocus></label>
+      <datalist id="dl-pnames">${[...new Set(D.products().map(x => x.name))].sort(cmpZh).map(n => `<option value="${esc(n)}"></option>`).join('')}</datalist>
+      <label class="f span2" for="p-spec">規格<input id="p-spec" value="${esc(p.spec || '')}"></label>
+      <label class="f" for="p-cat">分類<input id="p-cat" value="${esc(p.category || '')}" list="dl-cats" autocomplete="off"></label>
+      <datalist id="dl-cats">${cats.map(c => `<option value="${esc(c)}"></option>`).join('')}</datalist>
+      <label class="f" for="p-unit">單位<input id="p-unit" value="${esc(p.unit || '')}"></label>
+      <label class="f" for="p-price">單價（NT$）<input id="p-price" type="number" min="0" step="any" inputmode="decimal" value="${esc(p.price ?? '')}"></label>
+      <label class="f" for="p-moq">最小訂量<input id="p-moq" type="number" min="0" step="any" value="${esc(p.moq || '')}"></label>
+      <label class="f" for="p-lead">交期（天）<input id="p-lead" type="number" min="0" step="1" value="${esc(p.leadDays || '')}"></label>
+      <label class="f span2" for="p-note">備註<textarea id="p-note" rows="2">${esc(p.note || '')}</textarea></label>
+      <p id="p-err" class="err span2" hidden></p>
+    </div>
+    <div class="dlg-foot">
+      ${isEdit ? `<div class="left"><button class="btn sm danger" type="button" data-act="delete-product" data-id="${esc(p.id)}" data-confirm="確定刪除？">刪除產品</button></div>` : ''}
+      <button type="button" class="btn ghost" data-close>取消</button>
+      <button type="submit" class="btn primary">儲存</button>
+    </div></form>`, () => {
+    $('#productForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const g = id => $('#' + id).value.trim();
+      const err = $('#p-err'), vendorId = g('p-vendor'), name = g('p-name');
+      if (!vendorId) { err.textContent = '請選擇廠商。'; err.hidden = false; return $('#p-vendor').focus(); }
+      if (!name) { err.textContent = '請填寫品名。'; err.hidden = false; return $('#p-name').focus(); }
+      const data = { vendorId, name, spec: g('p-spec'), category: g('p-cat'), unit: g('p-unit'), price: num(g('p-price')), moq: num(g('p-moq')), leadDays: num(g('p-lead')), note: g('p-note'), updatedAt: nowIso() };
+      closeDialog();
+      if (isEdit) upd('products', p.id, data, `已更新 ${name}`);
+      else { PBStore.save('products', { id: rid(), ...data }); toast(`已新增 ${name}`); }
+    });
+  });
+}
+function parseImport(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  const rows = lines.map(l => (l.includes('\t') ? l.split('\t') : l.split(',')).map(c => c.trim().replace(/^"|"$/g, '')));
+  if (rows.length && /廠商|供應商|vendor/i.test(rows[0][0] || '')) rows.shift();
+  return rows.map(r => ({ vendor: r[0] || '', name: r[1] || '', spec: r[2] || '', category: r[3] || '', unit: r[4] || '', price: num(r[5]), moq: num(r[6]), leadDays: num(r[7]) }))
+    .filter(r => r.vendor && r.name);
+}
+function openImport() {
+  if (!can('vendor')) return toast('你沒有維護產品資料的權限。');
+  openDialog(`<div class="dlg">
+    <div class="dlg-head"><div><h2>從 Excel 貼上匯入</h2><p class="hint">在 Excel 選取表格範圍、複製，貼到下面。每一列一項產品，欄位順序如下（第一列是標題也沒關係）：</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body">
+      <div class="imp-cols">廠商 ⇥ 品名 ⇥ 規格 ⇥ 分類 ⇥ 單位 ⇥ 單價 ⇥ 最小訂量 ⇥ 交期(天)</div>
+      <textarea id="imp-text" class="imp-text" placeholder="大成五金行	不鏽鋼螺絲	M6×20 SUS304	五金	支	2.5	500	2" aria-label="貼上表格內容"></textarea>
+      <p id="imp-sum" class="hint">還沒有內容。</p>
+      <p class="hint">同一家廠商、同品名、同規格的產品會更新單價和交期，不會重複新增。名錄裡沒有的廠商會自動建立。</p>
+    </div>
+    <div class="dlg-foot"><button type="button" class="btn ghost" data-close>取消</button><button type="button" class="btn primary" id="imp-go" disabled>匯入</button></div>
+  </div>`, () => {
+    const ta = $('#imp-text'), sum = $('#imp-sum'), go = $('#imp-go');
+    let rows = [];
+    ta.addEventListener('input', () => {
+      rows = parseImport(ta.value);
+      const known = new Set(D.vendors().map(v => v.name.trim()));
+      const newV = [...new Set(rows.map(r => r.vendor))].filter(n => !known.has(n));
+      sum.textContent = rows.length ? `讀到 ${rows.length} 項產品${newV.length ? `，會新增 ${newV.length} 家廠商：${newV.slice(0, 6).join('、')}${newV.length > 6 ? ' 等' : ''}` : ''}。` : (ta.value.trim() ? '讀不到資料：每一列至少要有「廠商」和「品名」兩欄。' : '還沒有內容。');
+      go.disabled = !rows.length;
+    });
+    go.addEventListener('click', () => runImport(rows));
+    ta.focus();
+  });
+}
+function runImport(rows) {
+  if (!rows.length) return;
+  const vByName = new Map(D.vendors().map(v => [v.name.trim(), v.id]));
+  const newVendors = [], prodMap = new Map();
+  let addedP = 0, updatedP = 0;
+  for (const r of rows) {
+    let vid = vByName.get(r.vendor);
+    if (!vid) {
+      vid = rid(); vByName.set(r.vendor, vid);
+      newVendors.push({ id: vid, name: r.vendor, category: r.category, contact: '', phone: '', email: '', terms: '', leadDays: r.leadDays || 0, note: '', createdAt: nowIso(), updatedAt: nowIso() });
+    }
+    const key = vid + '|' + r.name + '|' + r.spec;
+    const body = { vendorId: vid, name: r.name, spec: r.spec, category: r.category, unit: r.unit, price: r.price, moq: r.moq, leadDays: r.leadDays, updatedAt: nowIso() };
+    const prev = prodMap.get(key);
+    if (prev) { Object.assign(prev, body); continue; }
+    const ex = D.products().find(p => p.vendorId === vid && p.name === r.name && (p.spec || '') === r.spec);
+    if (ex) { updatedP++; prodMap.set(key, { ...ex, ...body }); }
+    else { addedP++; prodMap.set(key, { id: rid(), ...body, note: '' }); }
+  }
+  if (newVendors.length) PBStore.saveMany('vendors', newVendors);
+  PBStore.saveMany('products', [...prodMap.values()]);
+  closeDialog();
+  toast(`匯入完成：新增 ${addedP} 項、更新 ${updatedP} 項產品${newVendors.length ? `，新增 ${newVendors.length} 家廠商` : ''}。`);
+  S.pq = ''; $('#pq').value = ''; S.pvendor = ''; S.pcat = '';
+  if (S.view !== 'vendors') location.hash = 'vendors'; else render();
+}
+
+/* ---------- 人員與權限（管理員）---------- */
+const U = { list: null, admins: [], loading: false, error: '' };
+async function loadUsers() {
+  if (!isAdmin() || U.loading) return;
+  U.loading = true; renderUsers();
+  try { const j = await PBAuth.api('users'); U.list = j.users || []; U.admins = j.admins || []; U.error = ''; }
+  catch (e) { U.error = e.message; }
+  U.loading = false; renderUsers();
+}
+function renderUsers() {
+  const root = $('#userList');
+  if (!root || S.view !== 'users') return;
+  if (!U.list) { root.innerHTML = U.error ? `<div class="banner bad">讀不到人員名單：${esc(U.error)}<button class="btn sm" type="button" data-reload-users>重試</button></div>` : loadingBox('人員名單'); return; }
+  const fmt = ms => ms ? stamp(new Date(ms).toISOString()) : '還沒登入過';
+  const admins = U.admins.map(a => `<div class="urow"><div class="urow-main"><b>${esc(a)}</b><div class="row"><span class="chip perm">管理員：全部權限</span></div></div><span class="hint">要更換管理員，請改雲端後端 Code.gs 的 ADMIN_EMAILS_</span></div>`).join('');
+  const rows = U.list.map(u => `<div class="urow">
+    <div class="urow-main">
+      <b>${esc(u.name || u.email)}</b><span class="hint">${esc(u.email)} · 最後登入 ${esc(fmt(u.lastLogin))}</span>
+      <div class="row">${u.enabled ? '' : '<span class="chip off">已停用</span>'}${(u.pages || []).map(p => `<span class="chip perm">${esc(PERM_LABEL[p] || p)}</span>`).join('') || '<span class="chip">只能查看</span>'}</div>
+    </div>
+    <div class="row">
+      <button class="btn sm" type="button" data-edit-user="${esc(u.email)}">編輯</button>
+      <button class="btn sm" type="button" data-toggle-user="${esc(u.email)}">${u.enabled ? '停用' : '啟用'}</button>
+      <button class="btn sm danger" type="button" data-del-user="${esc(u.email)}" data-confirm="確定刪除？">刪除</button>
+    </div>
+  </div>`).join('');
+  root.innerHTML = `<div class="ulist">${admins}${rows}</div>${U.list.length ? '' : '<p class="hint">還沒有加入任何同事。按「＋ 新增人員」，輸入同事的 Gmail 並勾選權限。</p>'}${U.loading ? '<p class="hint">更新中…</p>' : ''}`;
+}
+function openUserForm(u) {
+  const isEdit = !!u;
+  u = u || { email: '', name: '', pages: ['order'], enabled: true };
+  openDialog(`<form id="userForm" class="dlg" novalidate>
+    <div class="dlg-head"><div><h2>${isEdit ? '編輯人員' : '新增人員'}</h2><p class="hint">同事用這個 Gmail 登入後，就能看到全部資料；下面勾選的是他能做的事。</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body form-grid">
+      <label class="f span2" for="u-email"><span class="req">Gmail</span><input id="u-email" type="email" value="${esc(u.email)}" ${isEdit ? 'readonly' : 'autofocus'} placeholder="name@gmail.com"></label>
+      <label class="f span2" for="u-name">姓名（顯示在簽核紀錄）<input id="u-name" value="${esc(u.name)}" placeholder="例如：王小明"></label>
+      <div class="f span2">權限<div class="perm-list">${PERMS.map(p => `<label class="perm" for="u-p-${p.id}"><input type="checkbox" id="u-p-${p.id}" value="${p.id}"${(u.pages || []).includes(p.id) ? ' checked' : ''}><span><b>${p.label}</b><span>${p.desc}</span></span></label>`).join('')}</div></div>
+      <p id="u-err" class="err span2" hidden></p>
+    </div>
+    <div class="dlg-foot"><button type="button" class="btn ghost" data-close>取消</button><button type="submit" class="btn primary" id="u-save">儲存</button></div>
+  </form>`, () => {
+    $('#userForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const email = $('#u-email').value.trim(), err = $('#u-err');
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { err.textContent = '請輸入正確的 Gmail 地址。'; err.hidden = false; return; }
+      const pages = PERMS.filter(p => $('#u-p-' + p.id).checked).map(p => p.id);
+      $('#u-save').disabled = true;
+      try {
+        const j = await PBAuth.api('userSave', { email, name: $('#u-name').value.trim(), pages, enabled: u.enabled !== false });
+        U.list = j.users || U.list; closeDialog(); renderUsers(); toast(isEdit ? '已更新' : `已加入 ${email}，請他用這個 Gmail 登入`);
+      } catch (x) { err.textContent = x.message; err.hidden = false; $('#u-save').disabled = false; }
+    });
+  });
+}
+async function userCall(action, payload, okMsg) {
+  try { const j = await PBAuth.api(action, payload); U.list = j.users || U.list; renderUsers(); toast(okMsg); }
+  catch (e) { toast(e.message); }
+}
+
+/* ---------- 範例資料（管理員） ---------- */
+function loadSample() {
+  if (!isAdmin() || S.busy) return;
+  const T = today();
+  const V = [
+    ['v1', '大成五金行', '五金', '業務 林先生', '04-2300-0101', '月結 30 天', 2],
+    ['v2', '全友機械零件', '機械零件', '業務 陳小姐', '04-2400-0202', '月結 60 天', 5],
+    ['v3', '永豐包裝材料', '包裝材料', '黃經理', '02-2200-0303', '月結 30 天', 3],
+    ['v4', '協和電子材料', '電子零件', '業務 張先生', '03-500-0404', '貨到付款', 7],
+    ['v5', '宏昌工業用品', '耗材', '業務 吳小姐', '06-200-0505', '月結 30 天', 2],
+    ['v6', '順發辦公文具', '辦公用品', '門市 李先生', '02-2700-0606', '現金', 1],
+  ];
+  const P = [
+    ['v1', '不鏽鋼螺絲', 'M6×20 SUS304', '五金', '支', 2.5, 500, 2], ['v1', '不鏽鋼螺帽', 'M6 SUS304', '五金', '個', 1.2, 500, 2],
+    ['v1', '平華司', 'M6 鍍鋅', '五金', '個', 0.6, 1000, 2], ['v1', '棉紗手套', '600g', '耗材', '打', 85, 10, 2],
+    ['v2', '不鏽鋼螺絲', 'M6×20 SUS304', '五金', '支', 2.2, 2000, 5], ['v2', '深溝滾珠軸承', '6204ZZ', '機械零件', '個', 68, 20, 5],
+    ['v2', '深溝滾珠軸承', '6205ZZ', '機械零件', '個', 82, 20, 5], ['v2', '三角皮帶', 'A-42', '機械零件', '條', 145, 5, 7],
+    ['v3', '五層紙箱', '60×40×40cm', '包裝材料', '個', 32, 100, 3], ['v3', '氣泡布', '120cm×100m', '包裝材料', '捲', 480, 2, 3],
+    ['v3', 'OPP 封箱膠帶', '48mm×100m 透明', '包裝材料', '捲', 28, 36, 2], ['v3', '棧板膜', '50cm×300m', '包裝材料', '捲', 260, 6, 3],
+    ['v4', '電阻', '1/4W 10kΩ', '電子零件', '包', 120, 1, 7], ['v4', '端子台', 'TB-2504', '電子零件', '個', 35, 10, 7],
+    ['v4', 'PVC 電線', '1.25mm² 黑', '電子零件', '捲', 950, 1, 5], ['v5', '棉紗手套', '600g', '耗材', '打', 78, 20, 2],
+    ['v5', '工業酒精', '95% 4L', '耗材', '桶', 420, 4, 3], ['v5', '擦拭布', '30×30cm 50入', '耗材', '包', 150, 10, 2],
+    ['v6', 'OPP 封箱膠帶', '48mm×100m 透明', '包裝材料', '捲', 32, 12, 1], ['v6', 'A4 影印紙', '70g 500張', '辦公用品', '包', 115, 10, 1],
+    ['v6', '五層紙箱', '60×40×40cm', '包裝材料', '個', 38, 20, 1],
+  ];
+  const O = [ // [日期差, 廠商, 品名, 規格, 數量, 單位, 單價, 需求日差, 申請人, 進度, 簽核, 已到貨, 備註, 退回原因]
+    [0, 'v2', '不鏽鋼螺絲', 'M6×20 SUS304', 2000, '支', 2.2, 5, '生產課', 'todo', 'l1', 0, ''],
+    [0, 'v3', '五層紙箱', '60×40×40cm', 300, '個', 32, 3, '出貨組', 'todo', 'approved', 0, '下週出貨用'],
+    [0, 'v5', '棉紗手套', '600g', 30, '打', 78, 2, '廠務課', 'todo', 'l2', 0, ''],
+    [0, 'v6', 'A4 影印紙', '70g 500張', 20, '包', 115, 2, '行政組', 'ordered', 'approved', 0, ''],
+    [0, 'v2', '深溝滾珠軸承', '6204ZZ', 40, '個', 68, 7, '保養課', 'todo', 'draft', 0, '數量待確認'],
+    [-1, 'v3', 'OPP 封箱膠帶', '48mm×100m 透明', 72, '捲', 28, 1, '出貨組', 'partial', 'approved', 36, ''],
+    [-1, 'v5', '工業酒精', '95% 4L', 8, '桶', 420, 2, '品保課', 'ordered', 'approved', 0, ''],
+    [-1, 'v4', '端子台', 'TB-2504', 100, '個', 35, 6, '生產課', 'todo', 'rejected', 0, '', '數量請依工單重新確認'],
+    [-2, 'v4', 'PVC 電線', '1.25mm² 黑', 3, '捲', 950, 4, '生產課', 'todo', 'l1', 0, ''],
+    [-3, 'v2', '三角皮帶', 'A-42', 10, '條', 145, -1, '保養課', 'ordered', 'approved', 0, '2 號產線備品'],
+    [-3, 'v3', '氣泡布', '120cm×100m', 4, '捲', 480, 0, '出貨組', 'received', 'approved', 4, ''],
+  ];
+  const at = (dayStr, h, m) => { const d = parseYmd(dayStr); d.setHours(h, m, 0, 0); return d.toISOString(); };
+  const vk = {}, vname = {};
+  const vendors = V.map(([k, name, category, contact, phone, terms, leadDays]) => { const id = rid() + k; vk[k] = id; vname[k] = name; return { id, name, category, contact, phone, email: '', terms, leadDays, note: '', sample: true, createdAt: nowIso(), updatedAt: nowIso() }; });
+  const products = P.map(([k, name, spec, category, unit, pr, moq, leadDays], i) => ({ id: rid() + 'p' + i, vendorId: vk[k], name, spec, category, unit, price: pr, moq, leadDays, note: '', sample: true, updatedAt: nowIso() }));
+  const seq = {};
+  const H = (act, at_, extra) => ({ id: rid() + Math.random().toString(36).slice(2, 5), act, by: '', at: at_, ...extra });
+  const orders = O.map(([off, k, item, spec, qty, unit, pr, needOff, requester, progress, approval, recv, note, rej], i) => {
+    const date = addDays(T, off), pre = 'PO' + date.replace(/-/g, '');
+    const existing = D.orders().filter(o => (o.no || '').startsWith(pre + '-')).length;
+    seq[pre] = (seq[pre] || existing) + 1;
+    const created = at(date, 8, 40 + i), h = [H('create', created)];
+    let submittedAt = null, approvedAt = null, orderedAt = null, receivedAt = null;
+    if (approval !== 'draft') { submittedAt = at(date, 9, 5 + i); h.push(H('submit', submittedAt, { role: '申請人' })); }
+    if (['l2', 'approved'].includes(approval)) h.push(H('approve', at(date, 10, 10 + i), { role: '主管' }));
+    if (approval === 'approved') { approvedAt = at(date, 11, 2 + i); h.push(H('approve', approvedAt, { role: '經理' })); }
+    if (approval === 'rejected') h.push(H('reject', at(date, 10, 30), { role: '主管', note: rej }));
+    if (['ordered', 'partial', 'received'].includes(progress)) { orderedAt = at(date, 13, 30 + i); h.push(H('progress', orderedAt, { to: 'ordered' })); }
+    if (progress === 'partial') h.push(H('progress', at(addDays(date, 1), 9, 20), { to: 'partial', add: recv }));
+    if (progress === 'received') { receivedAt = at(addDays(date, 2), 10, 0); h.push(H('progress', receivedAt, { to: 'received' })); }
+    return {
+      id: rid() + 'o' + i, no: pre + '-' + String(seq[pre]).padStart(3, '0'), date, item, spec, qty, unit, vendorId: vk[k], vendorName: vname[k],
+      price: pr, amount: Math.round(qty * pr * 100) / 100, needBy: addDays(T, needOff), requester, note, progress, approval,
+      receivedQty: recv, createdBy: '範例', createdAt: created, submittedAt, approvedAt, orderedAt, receivedAt, rejectNote: rej || '',
+      history: h, sample: true, updatedAt: nowIso(),
+    };
+  });
+  PBStore.saveMany('vendors', vendors);
+  PBStore.saveMany('products', products);
+  PBStore.saveMany('orders', orders);
+  toast('範例資料已載入，都標有「範例」。');
+}
+function clearSample() {
+  if (!isAdmin()) return;
+  let n = 0;
+  for (const k of ['orders', 'products', 'vendors']) { const ids = D[k]().filter(x => x.sample).map(x => x.id); n += ids.length; if (ids.length) PBStore.removeMany(k, ids); }
+  toast(`已清除 ${n} 筆範例資料。`);
+}
+
+/* ---------- 事件 ---------- */
+function arm(t) {
+  const orig = t.textContent;
+  t.classList.add('arm'); t.textContent = t.dataset.confirm;
+  setTimeout(() => { if (t.isConnected && t.classList.contains('arm')) { t.classList.remove('arm'); t.textContent = orig; } }, 4000);
+}
+document.addEventListener('click', e => {
+  const t = e.target.closest('button, [data-open]');
+  if (!t || t.closest('#f-offers') || t.closest('#loginGate')) return;
+  const d = t.dataset;
+  if (d.confirm && !t.classList.contains('arm')) { arm(t); return; }
+  if ('close' in d) return closeDialog();
+  if (d.open) return openDetail(d.open);
+  if (d.scope) { S.scope = d.scope; S.flag = null; return render(); }
+  if (d.kpi) {
+    if (d.kpi === 'appr') { location.hash = 'approvals'; return; }
+    if (d.kpi === 'day') { S.flag = null; S.scope = 'day'; } else S.flag = S.flag === d.kpi ? null : d.kpi;
+    return render();
+  }
+  if ('clearFlag' in d) { S.flag = null; return render(); }
+  if ('sync' in d || t.id === 'sync') { PBStore.syncNow(); return; }
+  if (d.cat !== undefined) { S.pcat = d.cat; return render(); }
+  if (d.vendor !== undefined) { S.pvendor = d.vendor; if (S.view !== 'vendors') location.hash = 'vendors'; else render(); return; }
+  if (d.orderProduct) {
+    const p = PBStore.get('products', d.orderProduct); if (!p) return;
+    return openOrderForm(null, { item: p.name, spec: p.spec, unit: p.unit, vendorId: p.vendorId, price: p.price, qty: p.moq || '', date: today(), needBy: p.leadDays ? addDays(today(), num(p.leadDays)) : '' });
+  }
+  if (d.editProduct) return openProductForm(PBStore.get('products', d.editProduct));
+  if (d.editVendor) return openVendorForm(vById.get(d.editVendor));
+  if ('newOrder' in d) return openOrderForm();
+  if ('addVendor' in d) return openVendorForm();
+  if ('addProduct' in d) return openProductForm();
+  if ('import' in d) return openImport();
+  if ('sample' in d) return loadSample();
+  if ('reloadUsers' in d) return loadUsers();
+  if (d.editUser) return openUserForm((U.list || []).find(u => u.email === d.editUser));
+  if (d.toggleUser) { const u = (U.list || []).find(x => x.email === d.toggleUser); if (u) userCall('userSave', { email: u.email, name: u.name, pages: u.pages, enabled: !u.enabled }, u.enabled ? `已停用 ${u.email}` : `已啟用 ${u.email}`); return; }
+  if (d.delUser) return userCall('userDelete', { email: d.delUser }, `已刪除 ${d.delUser}`);
+  if (d.act) {
+    if (d.act === 'clear-sample') return clearSample();
+    if (d.act === 'delete-vendor') {
+      if (!can('vendor')) return;
+      const v = vById.get(d.id); if (!v) return;
+      const ps = D.products().filter(p => p.vendorId === v.id).map(p => p.id);
+      closeDialog(); if (S.pvendor === v.id) S.pvendor = '';
+      if (ps.length) PBStore.removeMany('products', ps);
+      PBStore.remove('vendors', v.id);
+      return toast(`已刪除 ${v.name}${ps.length ? ` 和 ${ps.length} 項產品` : ''}`);
+    }
+    if (d.act === 'delete-product') { if (!can('vendor')) return; const p = PBStore.get('products', d.id); closeDialog(); if (p) { PBStore.remove('products', p.id); toast(`已刪除 ${p.name}`); } return; }
+    return orderAct(d.act, PBStore.get('orders', d.id), t);
+  }
+});
+$('#newOrderBtn').addEventListener('click', () => openOrderForm());
+$('#logoutBtn').addEventListener('click', () => PBAuth.logout());
+$('#addUserBtn').addEventListener('click', () => openUserForm());
+$('#exportBtn').addEventListener('click', exportCsv);
+$('#day').addEventListener('change', e => { if (e.target.value) { S.day = e.target.value; S.scope = 'day'; S.flag = null; render(); } });
+$('#prevDay').addEventListener('click', () => { S.day = addDays(S.day, -1); S.scope = 'day'; S.flag = null; render(); });
+$('#nextDay').addEventListener('click', () => { S.day = addDays(S.day, 1); S.scope = 'day'; S.flag = null; render(); });
+$('#todayBtn').addEventListener('click', () => { S.day = today(); S.scope = 'day'; S.flag = null; render(); });
+$('#oq').addEventListener('input', e => { S.q = e.target.value.trim(); renderOrders(); });
+$('#pq').addEventListener('input', e => { S.pq = e.target.value.trim(); renderVendors(); });
+$('#pvendor').addEventListener('change', e => { S.pvendor = e.target.value; renderVendors(); });
+window.addEventListener('hashchange', route);
+
+let tt;
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg; el.hidden = false;
+  if (el.showPopover) { try { if (el.matches(':popover-open')) el.hidePopover(); el.showPopover(); } catch (e) {} }
+  clearTimeout(tt);
+  tt = setTimeout(() => { if (el.hidePopover) { try { el.hidePopover(); } catch (e) {} } el.hidden = true; }, 3400);
+}
+
+/* ---------- 啟動 ---------- */
+PBStore.on((type, payload) => {
+  if (type === 'change') onData();
+  else if (type === 'status') { renderSync(); renderBanner(); }
+  else if (type === 'conflict') toast('有同事同時修改了同一筆資料，已自動合併；同一個欄位以你的修改為準。');
+});
+PBAuth.on(() => { route(); });
+PBAuth.ready.then(() => { onData(); route(); });
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  window.addEventListener('load', () => { navigator.serviceWorker.register('service-worker.js').catch(() => {}); });
+}
+// 跨日（App 開著過午夜）時，「今天」與逾期判斷跟著更新
+let lastDay = today();
+setInterval(() => { const t = today(); if (t !== lastDay) { if (S.day === lastDay) S.day = t; lastDay = t; render(); } }, 60000);
+})();
