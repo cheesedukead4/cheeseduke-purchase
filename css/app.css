@@ -403,6 +403,12 @@ table.pt{width:100%;border-collapse:collapse;font-size:13px}
   .cal-h{padding:6px 2px}
 }
 
+/* 廠商資料庫：代號、品類、零售價標記 */
+.vcode{font-family:var(--f-mono);font-size:.82em;font-weight:500;color:var(--ink-3);margin-right:6px}
+.tag-lv{display:inline-block;font-size:11px;padding:0 6px;border-radius:4px;background:var(--accent-soft);color:var(--accent);line-height:18px;margin-right:6px;white-space:nowrap;font-family:var(--f-body)}
+.tag-retail{display:inline-block;margin-left:6px;font-size:11px;padding:0 6px;border-radius:4px;background:var(--gold-soft);color:var(--gold-t);font-family:var(--f-body);font-weight:500;white-space:nowrap}
+.pt a{color:var(--accent)}
+
 /* 原物料分析 */
 .vseg{align-self:flex-start}
 .small2{font-size:12px;line-height:1.45}

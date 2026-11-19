@@ -9,8 +9,9 @@
  *   progress: todo|ordered|partial|received|cancelled, approval: draft|l1|l2|approved|rejected,
  *   receivedQty, createdBy, createdAt, submittedAt, approvedAt, orderedAt, receivedAt, rejectNote, prevProgress,
  *   history: [{ id, act, by, role, at, note, to, add }], sample?, updatedAt }
- * 廠商：{ id, name, category, contact, phone, email, terms, leadDays, note, sample? }
- * 產品：{ id, vendorId, name, spec, category, unit, price, moq, leadDays, note, sample? }
+ * 廠商：{ id, code(廠商代號), name, category, contact, phone, email, terms, leadDays, url(型錄／官網網址), note, sample? }
+ * 產品：{ id, vendorId, name, spec, category, unit, price(0＝未報價), priceType: ''(採購報價)|'retail'(公開零售價／菜單價),
+ *   moq, leadDays, level: ''(單一品項)|'cat'(品類)|'menu'(菜單品項), url(來源網址), note, sample? }
  * 內部原料 materials：{ id, code(料號), name, alias(其他名稱，逗號分隔), spec, category, unit, usage(每月用量), note, sample?, createdAt, updatedAt }
  * 每日工作項目 tasks：{ id, title, note, days: [0-6，空=每天], who: null(所有人) | [email], order, start, end(停用後的最後一天), createdAt, updatedAt }
  * 人員名冊 people：{ id: email, email, name, seenAt, off?(不做每日工作), createdAt, updatedAt }，登入時自動建立
@@ -75,7 +76,7 @@ const D = {
   events: () => PBStore.list('events'),
 };
 let vById = new Map();
-const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, cmonth: today().slice(0, 7), cday: today(), corders: true, vmode: 'products', mq: '', mflag: '', scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
+const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, cmonth: today().slice(0, 7), cday: today(), corders: true, vmode: 'products', mq: '', mflag: '', pall: false, scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
 const can = p => !!(window.PBAuth && PBAuth.can(p));
 const isAdmin = () => !!(window.PBAuth && PBAuth.isAdmin());
 const myName = () => (window.PBAuth && (PBAuth.name() || PBAuth.email())) || '';
@@ -357,16 +358,33 @@ function arow(o, kind) {
 }
 
 /* ---------- 廠商產品查詢 ---------- */
+// 報價種類：有單價的採購報價優先，其次是官網公開零售價／菜單價，最後是還沒報價的
+const isQuote = p => num(p.price) > 0 && p.priceType !== 'retail';
+const offerRank = p => isQuote(p) ? 0 : num(p.price) > 0 ? 1 : 2;
+const offerSort = (a, b) => (offerRank(a) - offerRank(b)) || (num(a.price) - num(b.price));
+const okUrl = u => /^https?:\/\/\S+$/i.test(String(u || '').trim());
+const extLink = (u, label) => okUrl(u) ? `<a href="${esc(String(u).trim())}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>` : '';
+const noPriceText = p => p.priceType === 'retail' ? '未標價' : '未報價';
+function priceCell(p) {
+  if (!(num(p.price) > 0)) return `<span class="muted">${noPriceText(p)}</span>`;
+  return `${price(p.price)}${p.unit ? `<small>／${esc(p.unit)}</small>` : ''}${p.priceType === 'retail' ? '<span class="tag-retail" title="官網公開零售價或菜單價，不是採購報價">零售價</span>' : ''}`;
+}
+const priceText = p => num(p.price) > 0 ? `${price(p.price)}${p.unit ? '／' + p.unit : ''}${p.priceType === 'retail' ? '（零售價）' : ''}` : noPriceText(p);
+const levelTag = p => p.level === 'cat' ? '<span class="tag-lv" title="廠商可供應的品類，不是單一品項">品類</span>' : p.level === 'menu' ? '<span class="tag-lv">菜單</span>' : '';
+const vendorSort = (a, b) => ((!a.code) - (!b.code)) || cmpZh(a.code || '', b.code || '') || cmpZh(a.name, b.name);
+const vLabel = v => (v.code ? v.code + ' ' : '') + v.name;
+const PGROUP_LIMIT = 60; // 沒有搜尋或篩選時，先顯示前 60 種產品，避免一次畫太多
+
 function renderVendors() {
   $$('[data-vmode]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.vmode === S.vmode)));
   $('#prodPane').hidden = S.vmode === 'materials';
   $('#matPane').hidden = S.vmode !== 'materials';
   if (S.vmode === 'materials') return renderMaterials();
   const vendors = D.vendors(), products = D.products();
-  const vs = [...vendors].sort((a, b) => cmpZh(a.name, b.name));
+  const vs = [...vendors].sort(vendorSort);
   const sel = $('#pvendor');
   if (S.pvendor && !vById.has(S.pvendor)) S.pvendor = '';
-  const opts = `<option value="">全部廠商</option>` + vs.map(v => `<option value="${esc(v.id)}">${esc(v.name)}</option>`).join('');
+  const opts = `<option value="">全部廠商</option>` + vs.map(v => `<option value="${esc(v.id)}">${esc(vLabel(v))}</option>`).join('');
   if (sel.dataset.h !== opts) { sel.innerHTML = opts; sel.dataset.h = opts; }
   sel.value = S.pvendor;
   const cats = [...new Set(products.map(p => p.category).filter(Boolean))].sort(cmpZh);
@@ -374,11 +392,13 @@ function renderVendors() {
   $('#cats').innerHTML = cats.length > 1 ? `<button type="button" class="chipbtn${!S.pcat ? ' on' : ''}" data-cat="">全部分類</button>` +
     cats.map(c => `<button type="button" class="chipbtn${S.pcat === c ? ' on' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('') : '';
   const counts = {}; for (const p of products) counts[p.vendorId] = (counts[p.vendorId] || 0) + 1;
-  $('#vcount').textContent = vs.length ? vs.length + ' 家' : '';
-  $('#vlist').innerHTML = vs.length ? vs.map(v => `<button type="button" class="vitem${S.pvendor === v.id ? ' on' : ''}" data-vendor="${esc(v.id)}">
-      <span class="vname">${esc(v.name)} ${sampleTag(v)}</span><span class="vcount">${counts[v.id] || 0} 項</span>
+  const q = S.pq.toLowerCase();
+  const vshow = q ? vs.filter(v => [v.code, v.name, v.category, v.contact, v.note].some(x => String(x || '').toLowerCase().includes(q))) : vs;
+  $('#vcount').textContent = vs.length ? (q ? `${vshow.length} / ${vs.length} 家` : vs.length + ' 家') : '';
+  $('#vlist').innerHTML = vshow.length ? vshow.map(v => `<button type="button" class="vitem${S.pvendor === v.id ? ' on' : ''}" data-vendor="${esc(v.id)}">
+      <span class="vname">${v.code ? `<span class="vcode">${esc(v.code)}</span>` : ''}${esc(v.name)} ${sampleTag(v)}</span><span class="vcount">${counts[v.id] || 0} 項</span>
       <span class="vmeta">${esc([v.category, v.contact].filter(Boolean).join(' · ') || '—')}</span></button>`).join('')
-    : `<p class="col-empty">還沒有廠商。</p>`;
+    : `<p class="col-empty">${vs.length ? '沒有符合的廠商。' : '還沒有廠商。'}</p>`;
   const out = $('#presults');
   if (!products.length && !vendors.length) {
     out.innerHTML = !loaded() ? loadingBox('廠商資料') : `<div class="empty"><h3>還沒有廠商產品資料</h3>
@@ -390,41 +410,42 @@ function renderVendors() {
   if (S.pvendor) {
     const v = vById.get(S.pvendor);
     const f = (k, val) => val ? `<div><dt>${k}</dt><dd>${esc(val)}</dd></div>` : '';
-    head = `<div class="vhead"><div class="vhead-top"><h3>${esc(v.name)}</h3>${sampleTag(v)}
+    head = `<div class="vhead"><div class="vhead-top"><h3>${v.code ? `<span class="vcode">${esc(v.code)}</span>` : ''}${esc(v.name)}</h3>${sampleTag(v)}
       ${can('vendor') ? `<button class="btn sm" type="button" data-edit-vendor="${esc(v.id)}">編輯廠商</button>` : ''}<button class="btn sm ghost" type="button" data-vendor="">看全部廠商</button></div>
-      <dl>${f('主要品類', v.category)}${f('聯絡人', v.contact)}${f('電話', v.phone)}${f('Email', v.email)}${f('付款條件', v.terms)}${v.leadDays ? f('平均交期', v.leadDays + ' 天') : ''}${f('備註', v.note)}</dl></div>`;
+      <dl>${f('主要品類', v.category)}${f('聯絡人', v.contact)}${f('電話', v.phone)}${f('Email', v.email)}${f('付款條件', v.terms)}${v.leadDays ? f('平均交期', v.leadDays + ' 天') : ''}${okUrl(v.url) ? `<div><dt>型錄／官網</dt><dd>${extLink(v.url, '開啟連結')}</dd></div>` : ''}${f('備註', v.note)}</dl></div>`;
   }
   let list = products;
   if (S.pvendor) list = list.filter(p => p.vendorId === S.pvendor);
   if (S.pcat) list = list.filter(p => p.category === S.pcat);
-  if (S.pq) {
-    const q = S.pq.toLowerCase();
-    list = list.filter(p => [p.name, p.spec, p.category, vName(p.vendorId)].some(x => String(x || '').toLowerCase().includes(q)));
-  }
+  if (q) list = list.filter(p => [p.name, p.spec, p.category, vName(p.vendorId), (vById.get(p.vendorId) || {}).code].some(x => String(x || '').toLowerCase().includes(q)));
   const groups = new Map();
   for (const p of list) { const k = (p.name || '').trim(); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(p); }
   const keys = [...groups.keys()].sort(cmpZh);
   let body;
   if (!keys.length) {
-    body = S.pq ? `<div class="empty"><h3>找不到「${esc(S.pq)}」</h3><p>試試比較短的關鍵字，例如只打「螺絲」或「紙箱」，或換個分類、改成全部廠商。</p></div>`
+    body = S.pq ? `<div class="empty"><h3>找不到「${esc(S.pq)}」</h3><p>試試比較短的關鍵字，例如只打「螺絲」或「紙箱」，或換個分類、改成全部廠商。${vshow.length ? `廠商名錄裡有 ${vshow.length} 家符合，點廠商名稱可以看它的型錄連結。` : ''}</p></div>`
       : `<div class="empty"><h3>這個條件下還沒有產品</h3><p>${S.pvendor ? '這家廠商還沒登錄產品。' : ''}${can('vendor') ? '可以按「新增產品」加入。' : ''}</p>${can('vendor') ? '<div class="row"><button class="btn" type="button" data-add-product>新增產品</button></div>' : ''}</div>`;
   } else {
     const showActs = can('order') || can('vendor');
-    body = `<p class="pcount">${keys.length} 種產品 · ${list.length} 筆報價${S.pq ? `（搜尋「${esc(S.pq)}」）` : ''}</p>` + keys.map(k => {
-      const arr = groups.get(k).sort((a, b) => num(a.price) - num(b.price));
+    const limited = !q && !S.pvendor && !S.pcat && !S.pall && keys.length > PGROUP_LIMIT;
+    const shown = limited ? keys.slice(0, PGROUP_LIMIT) : keys;
+    body = `<p class="pcount">${keys.length} 種產品 · ${list.length} 筆${S.pq ? `（搜尋「${esc(S.pq)}」）` : ''}</p>` + shown.map(k => {
+      const arr = groups.get(k).sort(offerSort);
       const vcount = new Set(arr.map(p => p.vendorId)).size;
-      const min = arr[0];
-      return `<div class="pgroup"><div class="pg-head"><h4>${esc(k)}</h4><span class="pg-sum">${vcount} 家供應${vcount > 1 ? ` · 最低 ${price(min.price)}／${esc(min.unit || '')}（${esc(vName(min.vendorId))}）` : ''}</span></div>
+      const quotes = arr.filter(isQuote);
+      const sum = quotes.length > 1 ? ` · 最低 ${price(quotes[0].price)}／${esc(quotes[0].unit || '')}（${esc(vName(quotes[0].vendorId))}）`
+        : !quotes.length && arr.some(p => num(p.price) > 0) ? ' · 只有公開零售價' : !quotes.length ? ' · 尚無報價' : '';
+      return `<div class="pgroup"><div class="pg-head"><h4>${esc(k)}</h4><span class="pg-sum">${vcount} 家供應${sum}</span></div>
         <div class="tscroll"><table class="pt"><thead><tr><th>廠商</th><th>規格</th><th class="r">單價</th><th class="r">最小訂量</th><th class="r">交期</th>${showActs ? '<th class="r"><span class="muted">操作</span></th>' : ''}</tr></thead><tbody>
         ${arr.map((p, i) => `<tr>
           <td><button type="button" class="link" data-vendor="${esc(p.vendorId)}">${esc(vName(p.vendorId))}</button> ${sampleTag(p)}</td>
-          <td>${esc(p.spec || '—')}${p.category ? ` <span class="muted">· ${esc(p.category)}</span>` : ''}</td>
-          <td class="r num">${price(p.price)}<small>／${esc(p.unit || '')}</small>${i === 0 && arr.length > 1 && num(p.price) < num(arr[arr.length - 1].price) ? '<span class="best">最低</span>' : ''}</td>
+          <td${p.note ? ` title="${esc(p.note)}"` : ''}>${levelTag(p)}${[p.spec ? esc(p.spec) : '', p.category ? `<span class="muted">${esc(p.category)}</span>` : '', okUrl(p.url) ? `<span class="muted">${extLink(p.url, '來源')}</span>` : ''].filter(Boolean).join(' <span class="muted">·</span> ') || (p.level ? '' : '—')}</td>
+          <td class="r num">${priceCell(p)}${i === 0 && isQuote(p) && quotes.length > 1 && num(p.price) < num(quotes[quotes.length - 1].price) ? '<span class="best">最低</span>' : ''}</td>
           <td class="r num">${p.moq ? qtyf(p.moq) + ' <small>' + esc(p.unit || '') + '</small>' : '—'}</td>
           <td class="r num">${p.leadDays ? qtyf(p.leadDays) + ' <small>天</small>' : '—'}</td>
           ${showActs ? `<td class="r"><span class="acts">${can('order') ? `<button class="btn sm" type="button" data-order-product="${esc(p.id)}">叫貨</button>` : ''}${can('vendor') ? `<button class="icon-btn sm" type="button" data-edit-product="${esc(p.id)}" aria-label="編輯 ${esc(p.name)}">✎</button>` : ''}</span></td>` : ''}
         </tr>`).join('')}</tbody></table></div></div>`;
-    }).join('');
+    }).join('') + (limited ? `<div class="row"><button class="btn" type="button" data-pall>還有 ${keys.length - PGROUP_LIMIT} 種產品，全部顯示</button><span class="hint">也可以用上面的搜尋、分類或廠商縮小範圍。</span></div>` : '');
   }
   out.innerHTML = head + body;
 }
@@ -1108,7 +1129,7 @@ function matAnalysis(m) {
     const unitOk = !m.unit || !p.unit || normKey(p.unit) === normKey(m.unit);
     const months = num(m.usage) > 0 && num(p.moq) > 0 && unitOk ? num(p.moq) / num(m.usage) : null;
     return { p, v: vById.get(p.vendorId) || null, specOk, unitOk, months };
-  }).sort((a, b) => (b.specOk - a.specOk) || (num(a.p.price) - num(b.p.price)));
+  }).sort((a, b) => (b.specOk - a.specOk) || offerSort(a.p, b.p));
   const good = offers.filter(o => o.specOk);
   const best = (good.length ? good : offers)[0] || null;
   const goodVendors = new Set(good.map(o => o.p.vendorId)).size;
@@ -1166,7 +1187,7 @@ function renderMaterials() {
       <td><button type="button" class="link" data-mat="${id}">${esc(m.name)}</button> ${sampleTag(m)}<div class="muted small2">${esc([m.spec, m.category].filter(Boolean).join(' · ') || '—')}</div></td>
       <td class="r num">${num(m.usage) ? qtyf(m.usage) + ' <small>' + esc(m.unit || '') + '</small>' : '<span class="muted">—</span>'}</td>
       <td>${a.goodVendors ? `<b class="num">${a.goodVendors}</b> 家<div class="muted small2">${esc(names.slice(0, 2).join('、'))}${names.length > 2 ? ' 等' : ''}</div>` : a.offers.length ? `<span class="muted">${a.vendors} 家（規格不同）</span>` : '<span class="bad-t">無</span>'}</td>
-      <td class="r num">${b ? `${price(b.p.price)}<small>／${esc(b.p.unit || '')}</small><div class="muted small2">${esc(b.v ? b.v.name : '')}</div>` : '—'}</td>
+      <td class="r num">${b ? `${priceCell(b.p)}<div class="muted small2">${esc(b.v ? b.v.name : '')}</div>` : '—'}</td>
       <td class="r num">${b && num(b.p.moq) ? `${qtyf(b.p.moq)} <small>${esc(b.p.unit || '')}</small>${b.months != null ? `<div class="small2 ${b.months > MOQ_MONTHS ? 'warn-t' : 'muted'}">${monthsText(b.months)}</div>` : ''}` : '—'}</td>
       <td class="r num">${b && num(b.p.leadDays) ? qtyf(b.p.leadDays) + ' <small>天</small>' : '—'}</td>
       <td>${b && b.v ? `${esc(b.v.contact || '—')}${b.v.phone ? `<div class="small2"><a class="mono" href="tel:${esc(b.v.phone.replace(/[^\d+]/g, ''))}">${esc(b.v.phone)}</a></div>` : ''}` : '—'}</td>
@@ -1204,9 +1225,9 @@ function matDetailHtml(id) {
   const offerRows = a.offers.map((o, i) => {
     const p = o.p, v = o.v || {};
     return `<tr>
-      <td><button type="button" class="link" data-vendor="${esc(p.vendorId)}">${esc(v.name || '（已刪除的廠商）')}</button>${o === a.best ? '<span class="best">最低</span>' : ''}</td>
+      <td><button type="button" class="link" data-vendor="${esc(p.vendorId)}">${esc(v.name || '（已刪除的廠商）')}</button>${o === a.best && isQuote(p) ? '<span class="best">最低</span>' : ''}</td>
       <td>${esc(p.spec || '—')}${o.specOk ? '' : ' <span class="chip warn">規格不同</span>'}</td>
-      <td class="r num">${price(p.price)}<small>／${esc(p.unit || '')}</small>${o.unitOk ? '' : ' <span class="chip warn">單位不同</span>'}</td>
+      <td class="r num">${priceCell(p)}${o.unitOk ? '' : ' <span class="chip warn">單位不同</span>'}</td>
       <td class="r num">${num(p.moq) ? qtyf(p.moq) : '—'}${o.months != null ? `<div class="small2 ${o.months > MOQ_MONTHS ? 'warn-t' : 'muted'}">${monthsText(o.months)}</div>` : ''}</td>
       <td class="r num">${num(p.leadDays) ? qtyf(p.leadDays) + ' 天' : '—'}</td>
       <td>${esc(v.contact || '—')}${v.phone ? `<div class="small2"><a class="mono" href="tel:${esc(v.phone.replace(/[^\d+]/g, ''))}">${esc(v.phone)}</a></div>` : ''}${v.email ? `<div class="small2"><a href="mailto:${esc(v.email)}">${esc(v.email)}</a></div>` : ''}</td>
@@ -1326,7 +1347,7 @@ function exportMatCsv() {
   const head = ['料號', '品名', '規格', '分類', '單位', '每月用量', '規格相符廠商數', '最低價廠商', '最低單價', '報價單位', 'MOQ', 'MOQ可用月數', '交期(天)', '聯絡人', '電話', 'Email', '付款條件', '檢核結果'];
   const rows = all.map(a => {
     const m = a.m, b = a.best, v = (b && b.v) || {};
-    return [m.code, m.name, m.spec, m.category, m.unit, m.usage || '', a.goodVendors, v.name || '', b ? b.p.price : '', b ? b.p.unit : '', b ? b.p.moq || '' : '', b && b.months != null ? b.months.toFixed(1) : '', b ? b.p.leadDays || '' : '', v.contact || '', v.phone || '', v.email || '', v.terms || '', a.flags.length ? a.flags.map(f => MFLAG[f].label).join('、') : '正常'];
+    return [m.code, m.name, m.spec, m.category, m.unit, m.usage || '', a.goodVendors, v.name || '', b && num(b.p.price) > 0 ? b.p.price : '', b ? b.p.unit : '', b ? b.p.moq || '' : '', b && b.months != null ? b.months.toFixed(1) : '', b ? b.p.leadDays || '' : '', v.contact || '', v.phone || '', v.email || '', v.terms || '', a.flags.length ? a.flags.map(f => MFLAG[f].label).join('、') : '正常'];
   });
   const csv = '﻿' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
   const el = document.createElement('a');
@@ -1508,24 +1529,24 @@ function mountOrderForm(o) {
   const upd2 = () => { $('#f-amount').textContent = money(num(qty.value) * num(priceI.value)); };
   const offers = () => {
     const name = item.value.trim();
-    const list = D.products().filter(p => p.name === name).sort((a, b) => num(a.price) - num(b.price));
+    const list = D.products().filter(p => p.name === name).sort(offerSort), nq = list.filter(isQuote).length;
     $('#f-offers').innerHTML = list.length
       ? `<div class="offers-h">${new Set(list.map(p => p.vendorId)).size} 家廠商有這項產品，點一下帶入廠商、規格和單價：</div>` +
-        list.map((p, i) => `<button type="button" class="offer${vendor.value === p.vendorId && (spec.value || '') === (p.spec || '') ? ' on' : ''}" data-pick="${esc(p.id)}"><b>${esc(vName(p.vendorId))}</b><span>${esc(p.spec || '')}</span><span class="num">${price(p.price)}／${esc(p.unit || '')}</span>${i === 0 && list.length > 1 ? '<em>最低</em>' : ''}</button>`).join('')
+        list.map((p, i) => `<button type="button" class="offer${vendor.value === p.vendorId && (spec.value || '') === (p.spec || '') ? ' on' : ''}" data-pick="${esc(p.id)}"><b>${esc(vName(p.vendorId))}</b><span>${esc(p.spec || '')}</span><span class="num">${esc(priceText(p))}</span>${i === 0 && isQuote(p) && nq > 1 ? '<em>最低</em>' : ''}</button>`).join('')
       : (name && D.products().length ? '<div class="offers-h">目前沒有廠商登錄這項產品，可以直接填寫。</div>' : '');
   };
   item.addEventListener('input', offers);
   spec.addEventListener('input', offers);
   vendor.addEventListener('change', () => {
     const p = D.products().find(x => x.name === item.value.trim() && x.vendorId === vendor.value);
-    if (p) { priceI.value = p.price ?? ''; if (!unit.value) unit.value = p.unit || ''; if (!spec.value) spec.value = p.spec || ''; upd2(); }
+    if (p) { priceI.value = num(p.price) > 0 ? p.price : ''; if (!unit.value) unit.value = p.unit || ''; if (!spec.value) spec.value = p.spec || ''; upd2(); }
     offers();
   });
   qty.addEventListener('input', upd2); priceI.addEventListener('input', upd2);
   $('#f-offers').addEventListener('click', e => {
     const b = e.target.closest('[data-pick]'); if (!b) return;
     const p = PBStore.get('products', b.dataset.pick); if (!p) return;
-    vendor.value = p.vendorId; priceI.value = p.price ?? ''; unit.value = p.unit || ''; spec.value = p.spec || '';
+    vendor.value = p.vendorId; priceI.value = num(p.price) > 0 ? p.price : ''; unit.value = p.unit || ''; spec.value = p.spec || '';
     if (!qty.value && p.moq) qty.value = p.moq;
     if (!$('#f-need').value && p.leadDays) $('#f-need').value = addDays($('#f-date').value || today(), num(p.leadDays));
     upd2(); offers();
@@ -1645,13 +1666,15 @@ function openVendorForm(v) {
   openDialog(`<form id="vendorForm" class="dlg" novalidate>
     <div class="dlg-head"><div><h2>${isEdit ? '編輯廠商' : '新增廠商'}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
     <div class="dlg-body form-grid">
-      <label class="f span2" for="v-name"><span class="req">廠商名稱</span><input id="v-name" value="${esc(v.name || '')}" autofocus></label>
+      <label class="f" for="v-code">廠商代號<input id="v-code" maxlength="20" value="${esc(v.code || '')}" placeholder="例如：A001"></label>
+      <label class="f" for="v-name"><span class="req">廠商名稱</span><input id="v-name" value="${esc(v.name || '')}" autofocus></label>
       <label class="f" for="v-cat">主要品類<input id="v-cat" value="${esc(v.category || '')}" placeholder="五金、包材、電子零件"></label>
       <label class="f" for="v-contact">聯絡人<input id="v-contact" value="${esc(v.contact || '')}"></label>
       <label class="f" for="v-phone">電話<input id="v-phone" type="tel" value="${esc(v.phone || '')}"></label>
       <label class="f" for="v-email">Email<input id="v-email" type="email" value="${esc(v.email || '')}"></label>
       <label class="f" for="v-terms">付款條件<input id="v-terms" value="${esc(v.terms || '')}" placeholder="月結 30 天"></label>
       <label class="f" for="v-lead">平均交期（天）<input id="v-lead" type="number" min="0" step="1" value="${esc(v.leadDays || '')}"></label>
+      <label class="f span2" for="v-url">型錄／官網網址<input id="v-url" type="url" inputmode="url" value="${esc(v.url || '')}" placeholder="https://"></label>
       <label class="f span2" for="v-note">備註<textarea id="v-note" rows="2">${esc(v.note || '')}</textarea></label>
       <p id="v-err" class="err span2" hidden></p>
     </div>
@@ -1663,10 +1686,13 @@ function openVendorForm(v) {
     $('#vendorForm').addEventListener('submit', e => {
       e.preventDefault();
       const g = id => $('#' + id).value.trim();
-      const name = g('v-name'), err = $('#v-err');
-      if (!name) { err.textContent = '請填寫廠商名稱。'; err.hidden = false; return $('#v-name').focus(); }
-      if (D.vendors().some(x => x.id !== v.id && x.name.trim() === name)) { err.textContent = '已經有同名的廠商。'; err.hidden = false; return; }
-      const data = { name, category: g('v-cat'), contact: g('v-contact'), phone: g('v-phone'), email: g('v-email'), terms: g('v-terms'), leadDays: num(g('v-lead')), note: g('v-note'), updatedAt: nowIso() };
+      const name = g('v-name'), code = g('v-code'), url = g('v-url'), err = $('#v-err');
+      const fail = (m, id) => { err.textContent = m; err.hidden = false; if (id) $('#' + id).focus(); };
+      if (!name) return fail('請填寫廠商名稱。', 'v-name');
+      if (D.vendors().some(x => x.id !== v.id && x.name.trim() === name && (!code || !x.code || x.code === code))) return fail('已經有同名的廠商。');
+      if (code && D.vendors().some(x => x.id !== v.id && normKey(x.code) === normKey(code))) return fail('已經有相同代號的廠商。', 'v-code');
+      if (url && !okUrl(url)) return fail('網址要以 http:// 或 https:// 開頭。', 'v-url');
+      const data = { code, name, category: g('v-cat'), contact: g('v-contact'), phone: g('v-phone'), email: g('v-email'), terms: g('v-terms'), leadDays: num(g('v-lead')), url, note: g('v-note'), updatedAt: nowIso() };
       closeDialog();
       if (isEdit) upd('vendors', v.id, data, `已更新 ${name}`);
       else { const id = rid(); S.pvendor = id; PBStore.save('vendors', { id, ...data, createdAt: nowIso() }); toast(`已新增 ${name}`); }
@@ -1677,23 +1703,28 @@ function openProductForm(p) {
   if (!can('vendor')) return toast('你沒有維護產品資料的權限。');
   p = p || {};
   const isEdit = !!p.id;
-  const vs = [...D.vendors()].sort((a, b) => cmpZh(a.name, b.name));
+  const vs = [...D.vendors()].sort(vendorSort);
   if (!vs.length) { toast('請先新增廠商，再登錄產品。'); return openVendorForm(); }
   const vid = p.vendorId || S.pvendor || '';
   const cats = [...new Set(D.products().map(x => x.category).filter(Boolean))].sort(cmpZh);
+  const opt = (val, label, cur) => `<option value="${val}"${(cur || '') === val ? ' selected' : ''}>${label}</option>`;
   openDialog(`<form id="productForm" class="dlg" novalidate>
     <div class="dlg-head"><div><h2>${isEdit ? '編輯產品' : '新增產品'}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
     <div class="dlg-body form-grid">
-      <label class="f span2" for="p-vendor"><span class="req">廠商</span><select id="p-vendor"><option value="">請選擇</option>${vs.map(v => `<option value="${esc(v.id)}"${v.id === vid ? ' selected' : ''}>${esc(v.name)}</option>`).join('')}</select></label>
+      <label class="f span2" for="p-vendor"><span class="req">廠商</span><select id="p-vendor"><option value="">請選擇</option>${vs.map(v => `<option value="${esc(v.id)}"${v.id === vid ? ' selected' : ''}>${esc(vLabel(v))}</option>`).join('')}</select></label>
       <label class="f span2" for="p-name"><span class="req">品名</span><input id="p-name" value="${esc(p.name || '')}" list="dl-pnames" autocomplete="off" autofocus></label>
       <datalist id="dl-pnames">${[...new Set(D.products().map(x => x.name))].sort(cmpZh).map(n => `<option value="${esc(n)}"></option>`).join('')}</datalist>
       <label class="f span2" for="p-spec">規格<input id="p-spec" value="${esc(p.spec || '')}"></label>
       <label class="f" for="p-cat">分類<input id="p-cat" value="${esc(p.category || '')}" list="dl-cats" autocomplete="off"></label>
       <datalist id="dl-cats">${cats.map(c => `<option value="${esc(c)}"></option>`).join('')}</datalist>
       <label class="f" for="p-unit">單位<input id="p-unit" value="${esc(p.unit || '')}"></label>
-      <label class="f" for="p-price">單價（NT$）<input id="p-price" type="number" min="0" step="any" inputmode="decimal" value="${esc(p.price ?? '')}"></label>
+      <label class="f" for="p-price">單價（NT$，沒有就空白）<input id="p-price" type="number" min="0" step="any" inputmode="decimal" value="${num(p.price) > 0 ? esc(p.price) : ''}"></label>
+      <label class="f" for="p-ptype">價格類型<select id="p-ptype">${opt('', '採購報價', p.priceType)}${opt('retail', '公開零售價／菜單價', p.priceType)}</select></label>
       <label class="f" for="p-moq">最小訂量<input id="p-moq" type="number" min="0" step="any" value="${esc(p.moq || '')}"></label>
       <label class="f" for="p-lead">交期（天）<input id="p-lead" type="number" min="0" step="1" value="${esc(p.leadDays || '')}"></label>
+      <label class="f" for="p-level">資料層級<select id="p-level">${opt('', '單一品項', p.level)}${opt('cat', '品類（不是單一品項）', p.level)}${opt('menu', '菜單品項', p.level)}</select></label>
+      <span class="f"></span>
+      <label class="f span2" for="p-url">來源網址（型錄、官網商品頁）<input id="p-url" type="url" inputmode="url" value="${esc(p.url || '')}" placeholder="https://"></label>
       <label class="f span2" for="p-note">備註<textarea id="p-note" rows="2">${esc(p.note || '')}</textarea></label>
       <p id="p-err" class="err span2" hidden></p>
     </div>
@@ -1705,72 +1736,186 @@ function openProductForm(p) {
     $('#productForm').addEventListener('submit', e => {
       e.preventDefault();
       const g = id => $('#' + id).value.trim();
-      const err = $('#p-err'), vendorId = g('p-vendor'), name = g('p-name');
+      const err = $('#p-err'), vendorId = g('p-vendor'), name = g('p-name'), url = g('p-url');
       if (!vendorId) { err.textContent = '請選擇廠商。'; err.hidden = false; return $('#p-vendor').focus(); }
       if (!name) { err.textContent = '請填寫品名。'; err.hidden = false; return $('#p-name').focus(); }
-      const data = { vendorId, name, spec: g('p-spec'), category: g('p-cat'), unit: g('p-unit'), price: num(g('p-price')), moq: num(g('p-moq')), leadDays: num(g('p-lead')), note: g('p-note'), updatedAt: nowIso() };
+      if (url && !okUrl(url)) { err.textContent = '網址要以 http:// 或 https:// 開頭。'; err.hidden = false; return $('#p-url').focus(); }
+      const data = { vendorId, name, spec: g('p-spec'), category: g('p-cat'), unit: g('p-unit'), price: num(g('p-price')), priceType: g('p-ptype'), moq: num(g('p-moq')), leadDays: num(g('p-lead')), level: g('p-level'), url, note: g('p-note'), updatedAt: nowIso() };
       closeDialog();
       if (isEdit) upd('products', p.id, data, `已更新 ${name}`);
       else { PBStore.save('products', { id: rid(), ...data }); toast(`已新增 ${name}`); }
     });
   });
 }
+
+/* 從 Excel 貼上匯入：有標題列時依標題對欄位（可以貼「廠商名錄」或「產品／報價」表），沒有標題時照固定順序 */
+const IMP_COLS = {
+  code: ['廠商代號', '代號', '廠商編號', '供應商代號'],
+  vendor: ['廠商名稱', '廠商', '供應商', '供應商名稱'],
+  name: ['品名', '商品或服務名稱', '產品名稱', '商品名稱', '產品', '商品'],
+  spec: ['規格', '產品規格'],
+  category: ['分類', '分類／MENU範圍', '品類', '原始分類', '產品分類'],
+  unit: ['單位'],
+  price: ['單價', '單價(元)', '單價（元）', '公開售價起（元）', '公開售價起(元)', '售價', '價格'],
+  moq: ['最小訂量', 'MOQ', '最低訂購量'],
+  leadDays: ['交期(天)', '交期（天）', '交期'],
+  level: ['資料層級'],
+  priceText: ['價格或規格文字'],
+  url: ['商品／MENU來源網址', '主要菜單或型錄來源', '型錄網址', '官網', '網址', '來源網址', '公開網址（可複製開啟）'],
+  note: ['備註', '確認事項／備註'],
+  status: ['公開資訊狀態'],
+  srcType: ['來源類型', '資料來源類型'],
+  contact: ['聯絡人', '聯絡窗口'],
+  phone: ['電話', '聯絡電話'],
+  email: ['Email', 'E-mail', '電子郵件'],
+  terms: ['付款條件'],
+};
+const normH = s => String(s ?? '').replace(/[\s　]/g, '').toLowerCase();
+const IMP_INDEX = new Map(Object.entries(IMP_COLS).flatMap(([k, names]) => names.map(n => [normH(n), k])));
+// 解析 Excel 複製出來的表格（Tab 分隔；儲存格內有換行時 Excel 會加引號）
+function parseDelimited(text) {
+  const delim = text.includes('\t') ? '\t' : ',', rows = [];
+  let row = [], cell = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else inQ = false; } else cell += c; }
+    else if (c === '"' && cell === '') inQ = true;
+    else if (c === delim) { row.push(cell.trim()); cell = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell.trim()); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell.trim()); rows.push(row); }
+  return rows.filter(r => r.some(c => c));
+}
 function parseImport(text) {
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
-  const rows = lines.map(l => (l.includes('\t') ? l.split('\t') : l.split(',')).map(c => c.trim().replace(/^"|"$/g, '')));
-  if (rows.length && /廠商|供應商|vendor/i.test(rows[0][0] || '')) rows.shift();
-  return rows.map(r => ({ vendor: r[0] || '', name: r[1] || '', spec: r[2] || '', category: r[3] || '', unit: r[4] || '', price: num(r[5]), moq: num(r[6]), leadDays: num(r[7]) }))
-    .filter(r => r.vendor && r.name);
+  const all = parseDelimited(text);
+  let hi = -1, map = null;
+  for (let i = 0; i < Math.min(all.length, 15); i++) {
+    const m = {}; let hits = 0;
+    all[i].forEach((c, j) => { const k = IMP_INDEX.get(normH(c)); if (k && !(k in m)) { m[k] = j; hits++; } });
+    if (hits >= 2 && ('vendor' in m || 'code' in m)) { hi = i; map = m; break; }
+  }
+  if (hi < 0) {
+    const rows = all.slice();
+    if (rows.length && /廠商|供應商|vendor/i.test(rows[0][0] || '')) rows.shift();
+    return { mode: 'products', header: false, skipped: [], rows: rows.map(r => ({ code: '', vendor: r[0] || '', name: r[1] || '', spec: r[2] || '', category: r[3] || '', unit: r[4] || '', price: num(r[5]), moq: num(r[6]), leadDays: num(r[7]) })).filter(r => r.vendor && r.name) };
+  }
+  const get = (r, k) => k in map ? String(r[map[k]] ?? '').trim() : '';
+  const body = all.slice(hi + 1);
+  if ('name' in map) {
+    const rows = body.map(r => {
+      const lv = get(r, 'level');
+      const level = /品類/.test(lv) ? 'cat' : /菜單/.test(lv) ? 'menu' : '';
+      return {
+        code: get(r, 'code'), vendor: get(r, 'vendor'), name: get(r, 'name'), spec: get(r, 'spec'), category: get(r, 'category'), unit: get(r, 'unit'),
+        price: num(get(r, 'price')), moq: num(get(r, 'moq')), leadDays: num(get(r, 'leadDays')), url: get(r, 'url'),
+        level, priceType: /實際商品|菜單|零售/.test(lv) ? 'retail' : '', note: [level === 'cat' ? '' : lv, get(r, 'priceText'), get(r, 'note')].filter(Boolean).join('｜'),
+      };
+    }).filter(r => (r.vendor || r.code) && r.name);
+    return { mode: 'products', header: true, skipped: [], rows, byCat: !('spec' in map) };
+  }
+  const skipped = [], rows = [];
+  for (const r of body) {
+    const x = { code: get(r, 'code'), name: get(r, 'vendor'), category: get(r, 'category'), url: get(r, 'url'), contact: get(r, 'contact'), phone: get(r, 'phone'), email: get(r, 'email'), terms: get(r, 'terms'),
+      note: [get(r, 'status'), get(r, 'srcType'), get(r, 'note')].filter(Boolean).join('｜') };
+    if (!x.name && !x.code) continue;
+    if (/非廠商/.test(get(r, 'status'))) { skipped.push(x.name || x.code); continue; }
+    rows.push(x);
+  }
+  return { mode: 'vendors', header: true, skipped, rows };
+}
+// 廠商比對：有代號用代號，沒有就用名稱（名稱相同但代號不同的視為不同廠商）
+function vendorMatcher() {
+  const byCode = new Map(), byName = new Map();
+  const add = v => { if (v.code) byCode.set(normKey(v.code), v); if (v.name) byName.set(v.name.trim(), v); };
+  D.vendors().forEach(add);
+  const find = (code, name) => {
+    const c = code && byCode.get(normKey(code)); if (c) return c;
+    const n = name && byName.get(name.trim());
+    return n && (!code || !n.code || normKey(n.code) === normKey(code)) ? n : null;
+  };
+  return { find, add };
+}
+function importSummary(parsed) {
+  const { mode, rows, skipped } = parsed, vm = vendorMatcher(), fresh = new Set();
+  for (const r of rows) {
+    const name = mode === 'vendors' ? r.name : r.vendor;
+    if (!vm.find(r.code, name)) { const k = r.code ? 'c:' + normKey(r.code) : 'n:' + name.trim(); fresh.add(k); vm.add({ code: r.code, name }); }
+  }
+  if (mode === 'vendors') return `讀到 ${rows.length} 家廠商資料：會新增 ${fresh.size} 家、更新 ${rows.length - fresh.size} 家${skipped.length ? `；略過 ${skipped.length} 筆標示為非廠商的費用類別（${skipped.slice(0, 5).join('、')}${skipped.length > 5 ? ' 等' : ''}）` : ''}。`;
+  const cat = rows.filter(r => r.level === 'cat').length, retail = rows.filter(r => r.priceType === 'retail').length;
+  return `讀到 ${rows.length} 項產品${cat || retail ? `（品類 ${cat}、公開零售價／菜單 ${retail}、其他 ${rows.length - cat - retail}）` : ''}${fresh.size ? `，會新增 ${fresh.size} 家廠商` : ''}。`;
 }
 function openImport() {
   if (!can('vendor')) return toast('你沒有維護產品資料的權限。');
   openDialog(`<div class="dlg">
-    <div class="dlg-head"><div><h2>從 Excel 貼上匯入</h2><p class="hint">在 Excel 選取表格範圍、複製，貼到下面。每一列一項產品，欄位順序如下（第一列是標題也沒關係）：</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-head"><div><h2>從 Excel 貼上匯入</h2><p class="hint">在 Excel 選取表格範圍（連同標題列）、複製，貼到下面。會依標題自動對應欄位，可以貼「廠商名錄」或「產品／報價」表。</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
     <div class="dlg-body">
-      <div class="imp-cols">廠商 ⇥ 品名 ⇥ 規格 ⇥ 分類 ⇥ 單位 ⇥ 單價 ⇥ 最小訂量 ⇥ 交期(天)</div>
+      <div class="imp-cols">產品表常用標題：廠商代號、廠商、品名、規格、分類、單位、單價、最小訂量、交期、資料層級、備註</div>
+      <div class="imp-cols">廠商名錄常用標題：廠商代號、廠商名稱、分類、聯絡人、電話、Email、付款條件、網址、備註</div>
+      <div class="imp-cols">沒有標題列時照這個順序：廠商 ⇥ 品名 ⇥ 規格 ⇥ 分類 ⇥ 單位 ⇥ 單價 ⇥ 最小訂量 ⇥ 交期(天)</div>
       <textarea id="imp-text" class="imp-text" placeholder="大成五金行	不鏽鋼螺絲	M6×20 SUS304	五金	支	2.5	500	2" aria-label="貼上表格內容"></textarea>
       <p id="imp-sum" class="hint">還沒有內容。</p>
-      <p class="hint">同一家廠商、同品名、同規格的產品會更新單價和交期，不會重複新增。名錄裡沒有的廠商會自動建立。</p>
+      <p class="hint">有廠商代號時用代號比對廠商，否則用名稱；名錄裡沒有的廠商會自動建立。同一家廠商、同品名、同規格的產品會更新，不會重複新增。資料層級是「官網實際商品」「餐廳菜單品名」的會標成公開零售價，「商品／服務品類」會標成品類。</p>
     </div>
     <div class="dlg-foot"><button type="button" class="btn ghost" data-close>取消</button><button type="button" class="btn primary" id="imp-go" disabled>匯入</button></div>
   </div>`, () => {
     const ta = $('#imp-text'), sum = $('#imp-sum'), go = $('#imp-go');
-    let rows = [];
+    let parsed = null;
     ta.addEventListener('input', () => {
-      rows = parseImport(ta.value);
-      const known = new Set(D.vendors().map(v => v.name.trim()));
-      const newV = [...new Set(rows.map(r => r.vendor))].filter(n => !known.has(n));
-      sum.textContent = rows.length ? `讀到 ${rows.length} 項產品${newV.length ? `，會新增 ${newV.length} 家廠商：${newV.slice(0, 6).join('、')}${newV.length > 6 ? ' 等' : ''}` : ''}。` : (ta.value.trim() ? '讀不到資料：每一列至少要有「廠商」和「品名」兩欄。' : '還沒有內容。');
-      go.disabled = !rows.length;
+      parsed = parseImport(ta.value);
+      sum.textContent = parsed.rows.length ? importSummary(parsed) : (ta.value.trim() ? '讀不到資料：每一列至少要有「廠商」和「品名」，或貼上含「廠商名稱／廠商代號」標題的廠商名錄。' : '還沒有內容。');
+      go.disabled = !parsed.rows.length;
     });
-    go.addEventListener('click', () => runImport(rows));
+    go.addEventListener('click', () => { if (parsed) runImport(parsed); });
     ta.focus();
   });
 }
-function runImport(rows) {
+function runImport(parsed) {
+  const { mode, rows, header } = parsed;
   if (!rows.length) return;
-  const vByName = new Map(D.vendors().map(v => [v.name.trim(), v.id]));
-  const newVendors = [], prodMap = new Map();
-  let addedP = 0, updatedP = 0;
-  for (const r of rows) {
-    let vid = vByName.get(r.vendor);
-    if (!vid) {
-      vid = rid(); vByName.set(r.vendor, vid);
-      newVendors.push({ id: vid, name: r.vendor, category: r.category, contact: '', phone: '', email: '', terms: '', leadDays: r.leadDays || 0, note: '', createdAt: nowIso(), updatedAt: nowIso() });
+  const T = nowIso(), vm = vendorMatcher(), vOut = new Map(), touched = new Set();
+  let addedV = 0;
+  const setNonEmpty = (obj, fields) => { for (const [k, val] of Object.entries(fields)) if (val !== '' && val != null && !(typeof val === 'number' && !val)) obj[k] = val; };
+  const upsertV = (code, name, fields) => {
+    const found = vm.find(code, name);
+    if (found) {
+      const cur = vOut.get(found.id) || { ...found };
+      setNonEmpty(cur, { code, ...fields }); cur.updatedAt = T;
+      if (!cur._new) touched.add(found.id);
+      vOut.set(found.id, cur); vm.add(cur); return cur;
     }
-    const key = vid + '|' + r.name + '|' + r.spec;
-    const body = { vendorId: vid, name: r.name, spec: r.spec, category: r.category, unit: r.unit, price: r.price, moq: r.moq, leadDays: r.leadDays, updatedAt: nowIso() };
-    const prev = prodMap.get(key);
-    if (prev) { Object.assign(prev, body); continue; }
-    const ex = D.products().find(p => p.vendorId === vid && p.name === r.name && (p.spec || '') === r.spec);
-    if (ex) { updatedP++; prodMap.set(key, { ...ex, ...body }); }
-    else { addedP++; prodMap.set(key, { id: rid(), ...body, note: '' }); }
+    const nv = { id: rid(), code: code || '', name: name || code, category: '', contact: '', phone: '', email: '', terms: '', leadDays: 0, url: '', note: '', createdAt: T, updatedAt: T, _new: true };
+    setNonEmpty(nv, fields); addedV++;
+    vOut.set(nv.id, nv); vm.add(nv); return nv;
+  };
+  let addedP = 0, updatedP = 0;
+  const pOut = new Map();
+  if (mode === 'vendors') {
+    for (const r of rows) upsertV(r.code, r.name, { name: r.name, category: r.category, url: okUrl(r.url) ? r.url : '', note: r.note, contact: r.contact, phone: r.phone, email: r.email, terms: r.terms });
+  } else {
+    const pkey = (vid, name, spec, cat) => vid + '|' + name.trim() + '|' + (spec || '').trim() + (parsed.byCat ? '|' + (cat || '').trim() : '');
+    const existing = new Map(D.products().map(p => [pkey(p.vendorId, p.name || '', p.spec, p.category), p]));
+    for (const r of rows) {
+      const v = vm.find(r.code, r.vendor) || upsertV(r.code, r.vendor, { name: r.vendor, category: r.category, leadDays: r.leadDays });
+      const key = pkey(v.id, r.name, r.spec, r.category);
+      const body = { vendorId: v.id, name: r.name, spec: r.spec, category: r.category, unit: r.unit, price: r.price, moq: r.moq, leadDays: r.leadDays, updatedAt: T };
+      if (header) Object.assign(body, { level: r.level || '', priceType: r.priceType || '', url: okUrl(r.url) ? r.url : '', ...(r.note ? { note: r.note } : {}) });
+      const prev = pOut.get(key);
+      if (prev) { Object.assign(prev, body); continue; }
+      const ex = existing.get(key);
+      if (ex) { updatedP++; pOut.set(key, { ...ex, ...body }); }
+      else { addedP++; pOut.set(key, { id: rid(), note: '', ...body }); }
+    }
   }
-  if (newVendors.length) PBStore.saveMany('vendors', newVendors);
-  PBStore.saveMany('products', [...prodMap.values()]);
+  const vRecs = [...vOut.values()].map(v => { const { _new, ...rest } = v; return rest; });
+  if (vRecs.length) PBStore.saveMany('vendors', vRecs);
+  if (pOut.size) PBStore.saveMany('products', [...pOut.values()]);
   closeDialog();
-  toast(`匯入完成：新增 ${addedP} 項、更新 ${updatedP} 項產品${newVendors.length ? `，新增 ${newVendors.length} 家廠商` : ''}。`);
-  S.pq = ''; $('#pq').value = ''; S.pvendor = ''; S.pcat = '';
+  toast(mode === 'vendors'
+    ? `匯入完成：新增 ${addedV} 家、更新 ${touched.size} 家廠商${parsed.skipped.length ? `，略過 ${parsed.skipped.length} 筆非廠商` : ''}。`
+    : `匯入完成：新增 ${addedP} 項、更新 ${updatedP} 項產品${addedV ? `，新增 ${addedV} 家廠商` : ''}。`);
+  S.pq = ''; $('#pq').value = ''; S.pvendor = ''; S.pcat = ''; S.vmode = 'products';
   if (S.view !== 'vendors') location.hash = 'vendors'; else render();
 }
 
@@ -1932,6 +2077,7 @@ document.addEventListener('click', e => {
   if ('clearFlag' in d) { S.flag = null; return render(); }
   if ('sync' in d || t.id === 'sync') { PBStore.syncNow(); return; }
   if (d.cat !== undefined) { S.pcat = d.cat; return render(); }
+  if ('pall' in d) { S.pall = true; return render(); }
   if (d.vmode) { S.vmode = d.vmode; return render(); }
   if ('mflag' in d) { S.mflag = S.mflag === d.mflag && d.mflag ? '' : d.mflag; return render(); }
   if (d.mat) return openMatDetail(d.mat);
@@ -1944,7 +2090,7 @@ document.addEventListener('click', e => {
   if (d.vendor !== undefined) { S.pvendor = d.vendor; S.vmode = 'products'; closeDialog(); if (S.view !== 'vendors') location.hash = 'vendors'; else render(); return; }
   if (d.orderProduct) {
     const p = PBStore.get('products', d.orderProduct); if (!p) return;
-    return openOrderForm(null, { item: p.name, spec: p.spec, unit: p.unit, vendorId: p.vendorId, price: p.price, qty: p.moq || '', date: today(), needBy: p.leadDays ? addDays(today(), num(p.leadDays)) : '' });
+    return openOrderForm(null, { item: p.name, spec: p.spec, unit: p.unit, vendorId: p.vendorId, price: num(p.price) > 0 ? p.price : '', qty: p.moq || '', date: today(), needBy: p.leadDays ? addDays(today(), num(p.leadDays)) : '' });
   }
   if (d.editProduct) return openProductForm(PBStore.get('products', d.editProduct));
   if (d.editVendor) return openVendorForm(vById.get(d.editVendor));
