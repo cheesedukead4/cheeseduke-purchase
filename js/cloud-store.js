@@ -425,6 +425,8 @@
     var meta = all.meta || {};
     Object.assign(vers, meta.vers || {});
     (meta.dirty || []).forEach(function (k) { dirty.add(k); });
+    // 畫面可能在本機資料讀完之前就先讀過 list()，把「空的」結果記在 cache；讀完後要清掉，否則會一直顯示沒有資料
+    Object.keys(cache).forEach(function (k) { delete cache[k]; });
     return window.PBAuth ? PBAuth.ready : null; // 沒登入就不開始（登入畫面顯示中），登入後才讀雲端
   }).then(function () {
     var cfg = getConfig();
