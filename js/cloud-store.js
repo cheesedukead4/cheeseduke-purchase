@@ -5,6 +5,7 @@
  *      vendors        廠商資料
  *      products       廠商產品（報價）
  *      orders_YYYYMM  叫貨單，依「叫貨日期」的年月分檔，避免單一檔案越來越大、每次修改都要上傳全部歷史
+ *      materials      公司內部原料清單（原物料分析用，和廠商產品比對）
  *      tasks          每日工作項目（範本：做什麼、誰做、星期幾）
  *      people         人員名冊（登入過的人會自動加入，用來排每日工作）
  *      daily_YYYYMM   每日工作打勾與確認紀錄，一人一天一筆，依日期的年月分檔
@@ -20,9 +21,9 @@
   var STORE = 'kv';
   var POLL_MS = 30000;
   var PUSH_DELAY_MS = 800;
-  var LABELS = { vendors: '廠商資料', products: '廠商產品', orders: '叫貨單', tasks: '每日工作項目', people: '人員名冊', daily: '每日工作紀錄', events: '行事曆' };
+  var LABELS = { vendors: '廠商資料', products: '廠商產品', materials: '內部原料清單', orders: '叫貨單', tasks: '每日工作項目', people: '人員名冊', daily: '每日工作紀錄', events: '行事曆' };
   var MONTHLY = ['orders', 'daily', 'events'];   // 依日期年月分檔的種類（資料要有 date 欄位）
-  var KEY_RE = /^(vendors|products|tasks|people|(orders|daily|events)_\d{6})$/;
+  var KEY_RE = /^(vendors|products|materials|tasks|people|(orders|daily|events)_\d{6})$/;
 
   var parts = Object.create(null);   // 類別 -> JSON 字串（目前本機值，陣列）
   var bases = Object.create(null);   // 類別 -> 上次與雲端一致時的 JSON 字串（僅本機有未上傳修改時保存）

@@ -1,8 +1,8 @@
 /*
  * 採購工作看板：畫面程式
  * ---------------------------------------------------------------
- * 分頁：#orders 叫貨進度｜#daily 每日工作｜#calendar 行事曆｜#approvals 簽核｜#vendors 廠商產品查詢｜#users 人員與權限（只有管理員）
- * 資料：PBStore（js/cloud-store.js）的 orders、vendors、products、tasks、people、daily、events，會同步給所有人
+ * 分頁：#orders 叫貨進度｜#daily 每日工作｜#calendar 行事曆｜#approvals 簽核｜#vendors 廠商產品查詢（產品比價／原物料分析）｜#users 人員與權限（只有管理員）
+ * 資料：PBStore（js/cloud-store.js）的 orders、vendors、products、materials、tasks、people、daily、events，會同步給所有人
  * 權限：PBAuth.can(代號)，管理員全部都有。代號見 PERMS。這是畫面權限，雲端後端只擋「不在名單的人」。
  *
  * 叫貨單欄位：{ id, no, date, item, spec, qty, unit, vendorId, vendorName, price, amount, needBy, requester, note,
@@ -11,6 +11,7 @@
  *   history: [{ id, act, by, role, at, note, to, add }], sample?, updatedAt }
  * 廠商：{ id, name, category, contact, phone, email, terms, leadDays, note, sample? }
  * 產品：{ id, vendorId, name, spec, category, unit, price, moq, leadDays, note, sample? }
+ * 內部原料 materials：{ id, code(料號), name, alias(其他名稱，逗號分隔), spec, category, unit, usage(每月用量), note, sample?, createdAt, updatedAt }
  * 每日工作項目 tasks：{ id, title, note, days: [0-6，空=每天], who: null(所有人) | [email], order, start, end(停用後的最後一天), createdAt, updatedAt }
  * 人員名冊 people：{ id: email, email, name, seenAt, off?(不做每日工作), createdAt, updatedAt }，登入時自動建立
  * 每日紀錄 daily：{ id: 日期|email, date, email, name, checks: { 項目id: { at, t: 項目名稱 } }, extras: [{ id, title, done, at }],
@@ -67,13 +68,14 @@ const D = {
   orders: () => PBStore.list('orders'),
   vendors: () => PBStore.list('vendors'),
   products: () => PBStore.list('products'),
+  materials: () => PBStore.list('materials'),
   tasks: () => PBStore.list('tasks'),
   people: () => PBStore.list('people'),
   daily: () => PBStore.list('daily'),
   events: () => PBStore.list('events'),
 };
 let vById = new Map();
-const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, cmonth: today().slice(0, 7), cday: today(), corders: true, scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
+const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, cmonth: today().slice(0, 7), cday: today(), corders: true, vmode: 'products', mq: '', mflag: '', scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
 const can = p => !!(window.PBAuth && PBAuth.can(p));
 const isAdmin = () => !!(window.PBAuth && PBAuth.isAdmin());
 const myName = () => (window.PBAuth && (PBAuth.name() || PBAuth.email())) || '';
@@ -160,7 +162,7 @@ function renderBadge() {
   const left = info.rec && (info.rec.doneAt || info.rec.confirmAt) ? 0 : info.total - info.done;
   const db = $('#dailyBadge'); db.hidden = !left; db.textContent = left;
 }
-const sampleCount = () => ['orders', 'vendors', 'products'].reduce((a, k) => a + D[k]().filter(x => x.sample).length, 0);
+const sampleCount = () => ['orders', 'vendors', 'products', 'materials'].reduce((a, k) => a + D[k]().filter(x => x.sample).length, 0);
 const loaded = () => PBStore.status().loaded;
 function keepInputs(root, fn) {
   const vals = {}; $$('input,textarea', root).forEach(i => { if (i.id) vals[i.id] = i.value; });
@@ -356,6 +358,10 @@ function arow(o, kind) {
 
 /* ---------- 廠商產品查詢 ---------- */
 function renderVendors() {
+  $$('[data-vmode]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.vmode === S.vmode)));
+  $('#prodPane').hidden = S.vmode === 'materials';
+  $('#matPane').hidden = S.vmode !== 'materials';
+  if (S.vmode === 'materials') return renderMaterials();
   const vendors = D.vendors(), products = D.products();
   const vs = [...vendors].sort((a, b) => cmpZh(a.name, b.name));
   const sel = $('#pvendor');
@@ -1080,6 +1086,277 @@ function dayEventsHint(date) {
   return `<div class="hintbar dayev">${date === today() ? '今天' : md(date)}的行程：${items.map(({ e }) => `<button type="button" class="hchip ev c-${esc(e.cat || 'other')}" data-ev="${esc(e.id)}"><span class="dotc c-${esc(e.cat || 'other')}"></span>${e.time ? esc(e.time) + ' ' : ''}${esc(e.title)}</button>`).join('')}</div>`;
 }
 
+/* ---------- 原物料分析（公司內部原料 × 廠商報價） ---------- */
+// 公司內部原料清單（materials）用品名＋其他名稱比對廠商產品，檢核：有沒有供應商、是不是單一來源、
+// 規格和單位是否一致、最小訂量（MOQ）換算成幾個月的用量；並列出廠商聯絡方式。
+const MOQ_MONTHS = 3; // MOQ 超過幾個月用量算偏高
+const MFLAG = {
+  none: { label: '無供應商', tone: 'bad' },
+  spec: { label: '規格都不符', tone: 'warn' },
+  single: { label: '單一來源', tone: 'warn' },
+  moq: { label: 'MOQ 偏高', tone: 'warn' },
+  unit: { label: '單位不同', tone: 'warn' },
+};
+const MFLAG_ORDER = ['none', 'spec', 'single', 'moq', 'unit'];
+const normKey = s => String(s ?? '').toLowerCase().replace(/[\s　\-_/\\()（）［］\[\]·・.,，、]/g, '');
+const matNames = m => [m.name, ...String(m.alias || '').split(/[,，、;；]/)].map(normKey).filter(Boolean);
+const monthsText = x => x == null ? '' : x < 0.1 ? '不到 0.1 個月' : `約 ${x < 10 ? x.toFixed(1) : Math.round(x)} 個月`;
+function matAnalysis(m) {
+  const names = new Set(matNames(m));
+  const offers = D.products().filter(p => names.has(normKey(p.name))).map(p => {
+    const specOk = !m.spec || !p.spec || normKey(p.spec) === normKey(m.spec);
+    const unitOk = !m.unit || !p.unit || normKey(p.unit) === normKey(m.unit);
+    const months = num(m.usage) > 0 && num(p.moq) > 0 && unitOk ? num(p.moq) / num(m.usage) : null;
+    return { p, v: vById.get(p.vendorId) || null, specOk, unitOk, months };
+  }).sort((a, b) => (b.specOk - a.specOk) || (num(a.p.price) - num(b.p.price)));
+  const good = offers.filter(o => o.specOk);
+  const best = (good.length ? good : offers)[0] || null;
+  const goodVendors = new Set(good.map(o => o.p.vendorId)).size;
+  const ms = good.map(o => o.months).filter(x => x != null);
+  const minMonths = ms.length ? Math.min(...ms) : null;
+  const flags = [];
+  if (!offers.length) flags.push('none');
+  else {
+    if (!good.length) flags.push('spec');
+    else if (goodVendors === 1) flags.push('single');
+    if (minMonths != null && minMonths > MOQ_MONTHS) flags.push('moq');
+    if (offers.some(o => !o.unitOk)) flags.push('unit');
+  }
+  return { m, offers, good, best, goodVendors, vendors: new Set(offers.map(o => o.p.vendorId)).size, minMonths, flags };
+}
+const flagChips = a => a.flags.length ? a.flags.map(f => `<span class="chip ${MFLAG[f].tone}">${MFLAG[f].label}</span>`).join('') : '<span class="chip on">正常</span>';
+const contactOf = v => v ? [v.contact, v.phone].filter(Boolean).join(' · ') : '';
+
+function renderMaterials() {
+  const mats = D.materials(), root = $('#matBody');
+  $('#matTools').hidden = !can('vendor');
+  if (!mats.length) {
+    root.innerHTML = !loaded() ? loadingBox('原料清單') : `<div class="empty"><h3>還沒有公司內部原料清單</h3>
+      <p>把公司平常用的原物料（料號、品名、規格、單位、每月用量）建成清單，這裡會自動和廠商產品比對：哪些原料有幾家廠商供應、最低價和聯絡窗口、最小訂量（MOQ）夠用幾個月，並標出「無供應商」「單一來源」「MOQ 偏高」「規格／單位不符」的原料。</p>
+      <div class="row">${can('vendor') ? '<button class="btn primary" type="button" data-import-mat>從 Excel 貼上原料清單</button><button class="btn" type="button" data-add-mat>新增原料</button>' : '<span class="hint">請有「廠商產品維護」權限的同事建立原料清單。</span>'}${isAdmin() ? '<button class="btn" type="button" data-mat-sample>載入範例原料清單</button>' : ''}</div>
+      ${isAdmin() ? '<p class="small">範例原料都會標上「範例」，可以和其他範例資料一起清除。</p>' : ''}</div>`;
+    return;
+  }
+  const all = mats.map(matAnalysis);
+  const cnt = f => all.filter(a => a.flags.includes(f)).length;
+  const covered = all.filter(a => a.offers.length).length;
+  const tiles = [
+    { k: '', label: '內部原料', val: all.length, unit: '項', sub: `${covered} 項有廠商報價` },
+    { k: 'attn', label: '需要注意', val: all.filter(a => a.flags.length).length, unit: '項', sub: '有任何一項檢核不通過', tone: all.some(a => a.flags.length) ? 'warn' : '' },
+    { k: 'none', label: '無供應商', val: cnt('none'), unit: '項', sub: '廠商產品裡找不到', tone: cnt('none') ? 'bad' : '' },
+    { k: 'single', label: '單一來源', val: cnt('single'), unit: '項', sub: '只有一家規格相符', tone: cnt('single') ? 'warn' : '' },
+    { k: 'moq', label: 'MOQ 偏高', val: cnt('moq'), unit: '項', sub: `最小訂量超過 ${MOQ_MONTHS} 個月用量`, tone: cnt('moq') ? 'warn' : '' },
+  ];
+  let list = all;
+  if (S.mflag === 'attn') list = list.filter(a => a.flags.length);
+  else if (S.mflag === 'specunit') list = list.filter(a => a.flags.includes('spec') || a.flags.includes('unit'));
+  else if (S.mflag) list = list.filter(a => a.flags.includes(S.mflag));
+  if (S.mq) {
+    const q = S.mq.toLowerCase();
+    list = list.filter(a => [a.m.code, a.m.name, a.m.alias, a.m.spec, a.m.category, ...a.offers.map(o => o.v && o.v.name)].some(x => String(x || '').toLowerCase().includes(q)));
+  }
+  const rank = a => a.flags.length ? Math.min(...a.flags.map(f => MFLAG_ORDER.indexOf(f))) : 99;
+  list = list.slice().sort((a, b) => (rank(a) - rank(b)) || cmpZh(a.m.code || a.m.name, b.m.code || b.m.name));
+  const chipsF = [['', '全部'], ['attn', '需要注意'], ['none', '無供應商'], ['single', '單一來源'], ['moq', 'MOQ 偏高'], ['specunit', '規格／單位不符']];
+  const rows = list.map(a => {
+    const m = a.m, b = a.best, id = esc(m.id);
+    const names = [...new Set(a.good.map(o => o.v ? o.v.name : '（已刪除的廠商）'))];
+    return `<tr>
+      <td class="mono muted">${esc(m.code || '—')}</td>
+      <td><button type="button" class="link" data-mat="${id}">${esc(m.name)}</button> ${sampleTag(m)}<div class="muted small2">${esc([m.spec, m.category].filter(Boolean).join(' · ') || '—')}</div></td>
+      <td class="r num">${num(m.usage) ? qtyf(m.usage) + ' <small>' + esc(m.unit || '') + '</small>' : '<span class="muted">—</span>'}</td>
+      <td>${a.goodVendors ? `<b class="num">${a.goodVendors}</b> 家<div class="muted small2">${esc(names.slice(0, 2).join('、'))}${names.length > 2 ? ' 等' : ''}</div>` : a.offers.length ? `<span class="muted">${a.vendors} 家（規格不同）</span>` : '<span class="bad-t">無</span>'}</td>
+      <td class="r num">${b ? `${price(b.p.price)}<small>／${esc(b.p.unit || '')}</small><div class="muted small2">${esc(b.v ? b.v.name : '')}</div>` : '—'}</td>
+      <td class="r num">${b && num(b.p.moq) ? `${qtyf(b.p.moq)} <small>${esc(b.p.unit || '')}</small>${b.months != null ? `<div class="small2 ${b.months > MOQ_MONTHS ? 'warn-t' : 'muted'}">${monthsText(b.months)}</div>` : ''}` : '—'}</td>
+      <td class="r num">${b && num(b.p.leadDays) ? qtyf(b.p.leadDays) + ' <small>天</small>' : '—'}</td>
+      <td>${b && b.v ? `${esc(b.v.contact || '—')}${b.v.phone ? `<div class="small2"><a class="mono" href="tel:${esc(b.v.phone.replace(/[^\d+]/g, ''))}">${esc(b.v.phone)}</a></div>` : ''}` : '—'}</td>
+      <td><span class="flags">${flagChips(a)}</span></td>
+    </tr>`;
+  }).join('');
+  // 反向檢核：廠商有賣、但不在內部原料清單的產品
+  const known = new Set(mats.flatMap(matNames));
+  const extra = new Map();
+  for (const p of D.products()) { const k = normKey(p.name); if (!k || known.has(k)) continue; if (!extra.has(k)) extra.set(k, { p, vs: new Set() }); extra.get(k).vs.add(p.vendorId); }
+  const extras = [...extra.values()].sort((a, b) => cmpZh(a.p.name, b.p.name));
+  root.innerHTML = `<div class="kpis">${tiles.map(t => `<button type="button" class="kpi ${t.tone || ''}${(S.mflag || '') === t.k ? ' on' : ''}" data-mflag="${t.k}"><span class="k-label">${esc(t.label)}</span><span class="k-val">${t.val}<small>${t.unit}</small></span><span class="k-sub">${esc(t.sub)}</span></button>`).join('')}</div>
+    <div class="cats">${chipsF.map(([k, l]) => `<button type="button" class="chipbtn${(S.mflag || '') === k ? ' on' : ''}" data-mflag="${k}">${l}</button>`).join('')}</div>
+    ${list.length ? `<div class="pgroup"><div class="tscroll"><table class="pt mt"><thead><tr><th>料號</th><th>原料</th><th class="r">月用量</th><th>供應廠商</th><th class="r">最低單價</th><th class="r">MOQ</th><th class="r">交期</th><th>聯絡窗口</th><th>檢核</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+      <p class="hint">比對方式：原料的「品名」或「其他名稱」和廠商產品的品名相同就算同一種（不分大小寫、空白和標點）。最低單價、MOQ、交期、聯絡窗口取規格相符、價格最低的那家。點原料名稱看每一家的完整報價和聯絡方式。</p>`
+      : `<div class="empty"><h3>沒有符合條件的原料</h3><p>換個篩選條件或關鍵字試試。</p></div>`}
+    ${extras.length ? `<details class="asec mextra"><summary><h3>廠商有賣、但不在內部原料清單的產品 <span class="n">${extras.length}</span></h3></summary>
+      <p class="hint">可能是清單漏列，或品名寫法不同（可以在原料的「其他名稱」補上）。${can('vendor') ? '點一下可以直接加進原料清單。' : ''}</p>
+      <div class="cats">${extras.map(x => can('vendor')
+        ? `<button type="button" class="chipbtn" data-mat-from="${esc(x.p.id)}">＋ ${esc(x.p.name)} <span class="muted">${x.vs.size} 家</span></button>`
+        : `<span class="chipbtn">${esc(x.p.name)} <span class="muted">${x.vs.size} 家</span></span>`).join('')}</div></details>` : ''}`;
+}
+
+function matDetailHtml(id) {
+  const m = PBStore.get('materials', id);
+  if (!m) return `<div class="dlg"><div class="dlg-head"><div><h2>找不到這項原料</h2><p class="hint">可能已經被刪除。</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div></div>`;
+  const a = matAnalysis(m), mid = esc(m.id);
+  const checks = [
+    a.offers.length ? (a.goodVendors >= 2 ? ['ok', `有 ${a.goodVendors} 家廠商供應規格相符的產品`] : a.goodVendors === 1 ? ['warn', '只有 1 家廠商供應規格相符的產品（單一來源），建議再找備用廠商'] : ['warn', `有 ${a.vendors} 家廠商賣同名產品，但規格都和內部規格不同`]) : ['bad', '廠商產品裡找不到這項原料，需要開發供應商，或在「其他名稱」補上廠商用的品名'],
+    m.spec ? (a.offers.every(o => o.specOk) ? (a.offers.length ? ['ok', '規格和內部規格一致'] : null) : ['warn', `${a.offers.filter(o => !o.specOk).length} 筆報價規格不同（下表標「規格不同」）`]) : ['info', '內部清單沒有填規格，無法檢核規格'],
+    a.offers.some(o => !o.unitOk) ? ['warn', '有報價的單位和內部單位不同，MOQ 和價格要換算後再比'] : (a.offers.length && m.unit ? ['ok', '單位一致'] : null),
+    !num(m.usage) ? ['info', '沒有填每月用量，無法檢核 MOQ'] : a.minMonths == null ? (a.good.length ? ['info', '廠商沒有填最小訂量'] : null) : a.minMonths > MOQ_MONTHS ? ['warn', `最小訂量最少也要${monthsText(a.minMonths).replace('約 ', ' ')}的用量（超過 ${MOQ_MONTHS} 個月），注意庫存和資金積壓`] : ['ok', `最小訂量最少約 ${monthsText(a.minMonths).replace('約 ', '')}用量，在 ${MOQ_MONTHS} 個月內`],
+  ].filter(Boolean);
+  const mark = { ok: '✓', warn: '!', bad: '×', info: 'i' };
+  const offerRows = a.offers.map((o, i) => {
+    const p = o.p, v = o.v || {};
+    return `<tr>
+      <td><button type="button" class="link" data-vendor="${esc(p.vendorId)}">${esc(v.name || '（已刪除的廠商）')}</button>${o === a.best ? '<span class="best">最低</span>' : ''}</td>
+      <td>${esc(p.spec || '—')}${o.specOk ? '' : ' <span class="chip warn">規格不同</span>'}</td>
+      <td class="r num">${price(p.price)}<small>／${esc(p.unit || '')}</small>${o.unitOk ? '' : ' <span class="chip warn">單位不同</span>'}</td>
+      <td class="r num">${num(p.moq) ? qtyf(p.moq) : '—'}${o.months != null ? `<div class="small2 ${o.months > MOQ_MONTHS ? 'warn-t' : 'muted'}">${monthsText(o.months)}</div>` : ''}</td>
+      <td class="r num">${num(p.leadDays) ? qtyf(p.leadDays) + ' 天' : '—'}</td>
+      <td>${esc(v.contact || '—')}${v.phone ? `<div class="small2"><a class="mono" href="tel:${esc(v.phone.replace(/[^\d+]/g, ''))}">${esc(v.phone)}</a></div>` : ''}${v.email ? `<div class="small2"><a href="mailto:${esc(v.email)}">${esc(v.email)}</a></div>` : ''}</td>
+      <td>${esc(v.terms || '—')}</td>
+      ${can('order') ? `<td class="r"><button class="btn sm" type="button" data-order-product="${esc(p.id)}">叫貨</button></td>` : ''}
+    </tr>`;
+  }).join('');
+  const fact = (k, val) => `<div><dt>${k}</dt><dd>${val}</dd></div>`;
+  return `<div class="dlg wide">
+    <div class="dlg-head"><div><div class="eyebrow"><span class="po">${esc(m.code || '未填料號')}</span>${sampleTag(m)}<span class="flags">${flagChips(a)}</span></div><h2>${esc(m.name)}${m.spec ? ` <span class="spec">${esc(m.spec)}</span>` : ''}</h2></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body">
+      <dl class="facts">
+        ${fact('分類', esc(m.category || '—'))}${fact('單位', esc(m.unit || '—'))}${fact('每月用量', num(m.usage) ? `<span class="num">${qtyf(m.usage)}</span> ${esc(m.unit || '')}` : '—')}
+        ${m.alias ? `<div class="span-all"><dt>其他名稱</dt><dd>${esc(m.alias)}</dd></div>` : ''}
+        ${m.note ? `<div class="span-all"><dt>備註</dt><dd class="pre">${esc(m.note)}</dd></div>` : ''}
+      </dl>
+      <section><h3 class="sub-h">檢核結果</h3><ul class="mchecks">${checks.map(([t, s]) => `<li class="${t}"><span class="mk" aria-hidden="true">${mark[t]}</span><span>${esc(s)}</span></li>`).join('')}</ul></section>
+      <section><h3 class="sub-h">廠商報價與聯絡方式（${a.offers.length} 筆）</h3>
+        ${a.offers.length ? `<div class="tscroll"><table class="pt"><thead><tr><th>廠商</th><th>規格</th><th class="r">單價</th><th class="r">MOQ</th><th class="r">交期</th><th>聯絡人／電話／Email</th><th>付款條件</th>${can('order') ? '<th></th>' : ''}</tr></thead><tbody>${offerRows}</tbody></table></div>` : '<p class="hint">還沒有廠商報價。</p>'}
+      </section>
+    </div>
+    <div class="dlg-foot">
+      ${can('vendor') ? `<div class="left"><button class="btn sm danger" type="button" data-act="delete-material" data-id="${mid}" data-confirm="確定刪除？">刪除原料</button></div><button class="btn" type="button" data-edit-mat="${mid}">編輯原料</button>` : ''}
+      <button class="btn primary" type="button" data-close>完成</button>
+    </div>
+  </div>`;
+}
+function openMatDetail(id) { openDialog(matDetailHtml(id)); }
+
+function openMatForm(m, pre) {
+  if (!can('vendor')) return toast('你沒有維護原料清單的權限（廠商產品維護）。');
+  const isEdit = !!(m && m.id);
+  const v = m || pre || {};
+  const cats = [...new Set(D.materials().map(x => x.category).concat(D.products().map(x => x.category)).filter(Boolean))].sort(cmpZh);
+  openDialog(`<form id="matForm" class="dlg" novalidate>
+    <div class="dlg-head"><div><h2>${isEdit ? '編輯原料' : '新增原料'}</h2><p class="hint">品名或其他名稱和廠商產品相同，就會自動比對報價。</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body form-grid">
+      <label class="f" for="m-code">料號<input id="m-code" maxlength="40" value="${esc(v.code || '')}" placeholder="例如：RM-001"></label>
+      <label class="f" for="m-name"><span class="req">品名</span><input id="m-name" maxlength="60" value="${esc(v.name || '')}" ${isEdit ? '' : 'autofocus'}></label>
+      <label class="f span2" for="m-alias">其他名稱（廠商用的不同品名，用逗號分開）<input id="m-alias" maxlength="200" value="${esc(v.alias || '')}" placeholder="例如：工作手套, 棉手套"></label>
+      <label class="f span2" for="m-spec">規格<input id="m-spec" maxlength="80" value="${esc(v.spec || '')}" placeholder="和廠商報價的規格寫法一致，才能檢核規格"></label>
+      <label class="f" for="m-cat">分類<input id="m-cat" maxlength="30" value="${esc(v.category || '')}" list="dl-mcats" autocomplete="off"></label>
+      <datalist id="dl-mcats">${cats.map(c => `<option value="${esc(c)}"></option>`).join('')}</datalist>
+      <label class="f" for="m-unit">單位<input id="m-unit" maxlength="10" value="${esc(v.unit || '')}" placeholder="支、個、kg"></label>
+      <label class="f" for="m-usage">每月用量（用來檢核 MOQ）<input id="m-usage" type="number" min="0" step="any" inputmode="decimal" value="${esc(v.usage || '')}"></label>
+      <span class="f"></span>
+      <label class="f span2" for="m-note">備註<textarea id="m-note" rows="2" maxlength="300">${esc(v.note || '')}</textarea></label>
+      <p id="m-err" class="err span2" hidden></p>
+    </div>
+    <div class="dlg-foot">
+      ${isEdit ? `<div class="left"><button class="btn sm danger" type="button" data-act="delete-material" data-id="${esc(m.id)}" data-confirm="確定刪除？">刪除原料</button></div>` : ''}
+      <button type="button" class="btn ghost" data-close>取消</button>
+      <button type="submit" class="btn primary">儲存</button>
+    </div>
+  </form>`, () => {
+    $('#matForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const g = id => $('#' + id).value.trim(), err = $('#m-err'), fail = (t, id) => { err.textContent = t; err.hidden = false; if (id) $('#' + id).focus(); };
+      const name = g('m-name'), code = g('m-code');
+      if (!name) return fail('請填寫品名。', 'm-name');
+      if (code && D.materials().some(x => x.id !== (m && m.id) && normKey(x.code) === normKey(code))) return fail('已經有相同料號的原料。', 'm-code');
+      const data = { code, name, alias: g('m-alias'), spec: g('m-spec'), category: g('m-cat'), unit: g('m-unit'), usage: num(g('m-usage')), note: g('m-note'), updatedAt: nowIso() };
+      closeDialog();
+      if (isEdit) { upd('materials', m.id, data, `已更新 ${name}`); openMatDetail(m.id); }
+      else { const id = rid(); PBStore.save('materials', { id, ...data, createdAt: nowIso() }); toast(`已加入原料 ${name}`); openMatDetail(id); }
+    });
+  });
+}
+function parseMatImport(text) {
+  const rows = text.split(/\r?\n/).filter(l => l.trim()).map(l => (l.includes('\t') ? l.split('\t') : l.split(',')).map(c => c.trim().replace(/^"|"$/g, '')));
+  if (rows.length && (/料號|編號|品號|code/i.test(rows[0][0] || '') || /品名/.test(rows[0][1] || ''))) rows.shift();
+  return rows.map(r => ({ code: r[0] || '', name: r[1] || '', spec: r[2] || '', category: r[3] || '', unit: r[4] || '', usage: num(r[5]), alias: r[6] || '' })).filter(r => r.name);
+}
+function openMatImport() {
+  if (!can('vendor')) return toast('你沒有維護原料清單的權限（廠商產品維護）。');
+  openDialog(`<div class="dlg">
+    <div class="dlg-head"><div><h2>從 Excel 貼上原料清單</h2><p class="hint">在 Excel 選取表格範圍、複製，貼到下面。每一列一項原料，欄位順序如下（第一列是標題也沒關係）：</p></div><button type="button" class="icon-btn" data-close aria-label="關閉">×</button></div>
+    <div class="dlg-body">
+      <div class="imp-cols">料號 ⇥ 品名 ⇥ 規格 ⇥ 分類 ⇥ 單位 ⇥ 每月用量 ⇥ 其他名稱</div>
+      <textarea id="mimp-text" class="imp-text" placeholder="RM-001	不鏽鋼螺絲	M6×20 SUS304	五金	支	3000" aria-label="貼上表格內容"></textarea>
+      <p id="mimp-sum" class="hint">還沒有內容。</p>
+      <p class="hint">料號相同的會更新；沒有料號的，同品名、同規格會更新，不會重複新增。</p>
+    </div>
+    <div class="dlg-foot"><button type="button" class="btn ghost" data-close>取消</button><button type="button" class="btn primary" id="mimp-go" disabled>匯入</button></div>
+  </div>`, () => {
+    const ta = $('#mimp-text'), sum = $('#mimp-sum'), go = $('#mimp-go');
+    let rows = [];
+    ta.addEventListener('input', () => {
+      rows = parseMatImport(ta.value);
+      sum.textContent = rows.length ? `讀到 ${rows.length} 項原料。` : (ta.value.trim() ? '讀不到資料：每一列至少要有「品名」（第二欄）。' : '還沒有內容。');
+      go.disabled = !rows.length;
+    });
+    go.addEventListener('click', () => {
+      const cur = D.materials(), out = new Map();
+      let added = 0, updated = 0;
+      for (const r of rows) {
+        const key = r.code ? 'c:' + normKey(r.code) : 'n:' + normKey(r.name) + '|' + normKey(r.spec);
+        const body = { ...r, updatedAt: nowIso() };
+        if (out.has(key)) { Object.assign(out.get(key), body); continue; }
+        const ex = cur.find(x => r.code ? normKey(x.code) === normKey(r.code) : (!x.code && normKey(x.name) === normKey(r.name) && normKey(x.spec) === normKey(r.spec)));
+        if (ex) { updated++; out.set(key, { ...ex, ...body, alias: r.alias || ex.alias || '' }); }
+        else { added++; out.set(key, { id: rid(), ...body, note: '', createdAt: nowIso() }); }
+      }
+      PBStore.saveMany('materials', [...out.values()]);
+      closeDialog();
+      toast(`匯入完成：新增 ${added} 項、更新 ${updated} 項原料。`);
+      S.vmode = 'materials'; S.mflag = ''; S.mq = ''; $('#mq').value = '';
+      if (S.view !== 'vendors') location.hash = 'vendors'; else render();
+    });
+    ta.focus();
+  });
+}
+function exportMatCsv() {
+  const all = D.materials().map(matAnalysis).sort((a, b) => cmpZh(a.m.code || a.m.name, b.m.code || b.m.name));
+  if (!all.length) return toast('還沒有原料可以匯出。');
+  const cell = c => { let s = String(c ?? ''); if (/^[=+@]/.test(s) || /^-[^\d]/.test(s)) s = "'" + s; return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const head = ['料號', '品名', '規格', '分類', '單位', '每月用量', '規格相符廠商數', '最低價廠商', '最低單價', '報價單位', 'MOQ', 'MOQ可用月數', '交期(天)', '聯絡人', '電話', 'Email', '付款條件', '檢核結果'];
+  const rows = all.map(a => {
+    const m = a.m, b = a.best, v = (b && b.v) || {};
+    return [m.code, m.name, m.spec, m.category, m.unit, m.usage || '', a.goodVendors, v.name || '', b ? b.p.price : '', b ? b.p.unit : '', b ? b.p.moq || '' : '', b && b.months != null ? b.months.toFixed(1) : '', b ? b.p.leadDays || '' : '', v.contact || '', v.phone || '', v.email || '', v.terms || '', a.flags.length ? a.flags.map(f => MFLAG[f].label).join('、') : '正常'];
+  });
+  const csv = '﻿' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
+  const el = document.createElement('a');
+  el.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  el.download = `原物料分析_${today()}.csv`;
+  document.body.appendChild(el); el.click();
+  setTimeout(() => { URL.revokeObjectURL(el.href); el.remove(); }, 1500);
+  toast(`已匯出 ${all.length} 項原料的分析。`);
+}
+function loadSampleMaterials() {
+  if (!isAdmin()) return;
+  const M = [ // [料號, 品名, 規格, 分類, 單位, 每月用量, 其他名稱]
+    ['RM-001', '不鏽鋼螺絲', 'M6×20 SUS304', '五金', '支', 3000, ''],
+    ['RM-002', '不鏽鋼螺帽', 'M6 SUS304', '五金', '個', 2000, ''],
+    ['RM-003', '紙箱', '60×40×40cm', '包裝材料', '個', 400, '五層紙箱'],
+    ['RM-004', 'OPP 封箱膠帶', '48mm×100m 透明', '包裝材料', '捲', 60, '封箱膠帶'],
+    ['RM-005', '棧板膜', '50cm×300m', '包裝材料', '捲', 1.5, '伸縮膜'],
+    ['RM-006', '深溝滾珠軸承', '6204ZZ', '機械零件', '個', 8, '軸承'],
+    ['RM-007', '三角皮帶', 'A-42', '機械零件', '條', 1, ''],
+    ['RM-008', '工業酒精', '95% 4L', '耗材', '桶', 3, ''],
+    ['RM-009', '工作手套', '600g', '耗材', '打', 25, '棉紗手套'],
+    ['RM-010', 'PVC 電線', '2.0mm² 黑', '電子零件', '捲', 1, ''],
+    ['RM-011', '鋁擠型', '30×30 6063', '原料', '支', 50, ''],
+    ['RM-012', '矽利康', '透明 300ml', '耗材', '支', 40, ''],
+    ['RM-013', '電阻', '1/4W 10kΩ', '電子零件', '顆', 500, ''],
+  ];
+  PBStore.saveMany('materials', M.map(([code, name, spec, category, unit, usage, alias], i) => ({ id: rid() + 'm' + i, code, name, spec, category, unit, usage, alias, note: '', sample: true, createdAt: nowIso(), updatedAt: nowIso() })));
+  toast('範例原料清單已載入，都標有「範例」。');
+}
+
 /* ---------- 對話框 ---------- */
 const dlg = $('#dlg');
 function openDialog(html, mount) { S.detailId = null; S.dperson = null; dlg.innerHTML = html; if (!dlg.open) dlg.showModal(); if (mount) mount(); const first = dlg.querySelector('[autofocus]'); if (first) first.focus(); }
@@ -1623,12 +1900,13 @@ function loadSample() {
   PBStore.saveMany('vendors', vendors);
   PBStore.saveMany('products', products);
   PBStore.saveMany('orders', orders);
+  if (!D.materials().length) loadSampleMaterials();
   toast('範例資料已載入，都標有「範例」。');
 }
 function clearSample() {
   if (!isAdmin()) return;
   let n = 0;
-  for (const k of ['orders', 'products', 'vendors']) { const ids = D[k]().filter(x => x.sample).map(x => x.id); n += ids.length; if (ids.length) PBStore.removeMany(k, ids); }
+  for (const k of ['orders', 'products', 'vendors', 'materials']) { const ids = D[k]().filter(x => x.sample).map(x => x.id); n += ids.length; if (ids.length) PBStore.removeMany(k, ids); }
   toast(`已清除 ${n} 筆範例資料。`);
 }
 
@@ -1654,7 +1932,16 @@ document.addEventListener('click', e => {
   if ('clearFlag' in d) { S.flag = null; return render(); }
   if ('sync' in d || t.id === 'sync') { PBStore.syncNow(); return; }
   if (d.cat !== undefined) { S.pcat = d.cat; return render(); }
-  if (d.vendor !== undefined) { S.pvendor = d.vendor; if (S.view !== 'vendors') location.hash = 'vendors'; else render(); return; }
+  if (d.vmode) { S.vmode = d.vmode; return render(); }
+  if ('mflag' in d) { S.mflag = S.mflag === d.mflag && d.mflag ? '' : d.mflag; return render(); }
+  if (d.mat) return openMatDetail(d.mat);
+  if (d.editMat) return openMatForm(PBStore.get('materials', d.editMat));
+  if ('addMat' in d) return openMatForm(null);
+  if (d.matFrom) { const p = PBStore.get('products', d.matFrom); return openMatForm(null, p ? { name: p.name, spec: p.spec, category: p.category, unit: p.unit } : null); }
+  if ('importMat' in d) return openMatImport();
+  if ('matSample' in d) return loadSampleMaterials();
+  if ('matExport' in d) return exportMatCsv();
+  if (d.vendor !== undefined) { S.pvendor = d.vendor; S.vmode = 'products'; closeDialog(); if (S.view !== 'vendors') location.hash = 'vendors'; else render(); return; }
   if (d.orderProduct) {
     const p = PBStore.get('products', d.orderProduct); if (!p) return;
     return openOrderForm(null, { item: p.name, spec: p.spec, unit: p.unit, vendorId: p.vendorId, price: p.price, qty: p.moq || '', date: today(), needBy: p.leadDays ? addDays(today(), num(p.leadDays)) : '' });
@@ -1693,6 +1980,7 @@ document.addEventListener('click', e => {
       PBStore.remove('vendors', v.id);
       return toast(`已刪除 ${v.name}${ps.length ? ` 和 ${ps.length} 項產品` : ''}`);
     }
+    if (d.act === 'delete-material') { if (!can('vendor')) return; const m = PBStore.get('materials', d.id); closeDialog(); if (m) { PBStore.remove('materials', m.id); toast(`已刪除原料 ${m.name}`); } return; }
     if (d.act === 'delete-product') { if (!can('vendor')) return; const p = PBStore.get('products', d.id); closeDialog(); if (p) { PBStore.remove('products', p.id); toast(`已刪除 ${p.name}`); } return; }
     return orderAct(d.act, PBStore.get('orders', d.id), t);
   }
@@ -1720,6 +2008,7 @@ $('#dailyBody').addEventListener('submit', onDailySubmit);
 dlg.addEventListener('change', onDialogChange);
 $('#oq').addEventListener('input', e => { S.q = e.target.value.trim(); renderOrders(); });
 $('#pq').addEventListener('input', e => { S.pq = e.target.value.trim(); renderVendors(); });
+$('#mq').addEventListener('input', e => { S.mq = e.target.value.trim(); renderVendors(); });
 $('#pvendor').addEventListener('change', e => { S.pvendor = e.target.value; renderVendors(); });
 window.addEventListener('hashchange', route);
 

@@ -385,6 +385,30 @@ table.pt{width:100%;border-collapse:collapse;font-size:13px}
   .cal-h{padding:6px 2px}
 }
 
+/* 原物料分析 */
+.vseg{align-self:flex-start}
+.small2{font-size:12px;line-height:1.45}
+.warn-t{color:var(--warn);font-weight:500}
+.chip.warn{background:var(--warn-soft);color:var(--warn);border-color:transparent}
+.chip.bad{background:var(--bad-soft);color:var(--bad);border-color:transparent}
+.flags{display:inline-flex;gap:4px;flex-wrap:wrap;vertical-align:middle}
+table.mt td{vertical-align:top}
+table.mt td:first-child,.pt a.mono{white-space:nowrap}
+table.mt td:nth-child(2){min-width:150px}
+table.mt td:last-child{min-width:110px}
+.mchecks{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;font-size:14px}
+.mchecks li{display:flex;gap:10px;align-items:flex-start}
+.mk{width:20px;height:20px;flex:none;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;margin-top:1px;background:var(--sheet-2);color:var(--ink-2)}
+.mchecks .ok .mk{background:var(--ok-soft);color:var(--ok)}
+.mchecks .warn .mk{background:var(--warn-soft);color:var(--warn)}
+.mchecks .bad .mk{background:var(--bad-soft);color:var(--bad)}
+dialog#dlg:has(.dlg.wide){width:min(980px,calc(100vw - 24px))}
+.mextra{border:1px solid var(--rule);border-radius:var(--r);background:var(--sheet);padding:10px 14px}
+.mextra summary{cursor:pointer;list-style:revert}
+.mextra summary h3{display:inline-flex;gap:8px;font-size:14px}
+.mextra[open] summary{margin-bottom:8px}
+.mextra .hint{margin-bottom:8px}
+
 /* 空狀態、提示 */
 .empty{border:1px dashed var(--rule-2);border-radius:var(--r);background:var(--sheet);padding:28px 22px;display:flex;flex-direction:column;gap:10px;align-items:flex-start}
 .empty h3{font-size:17px}

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>採購工作看板</title>
-<meta name="description" content="每日叫貨進度、每日工作打勾確認、團隊行事曆、兩關簽核與廠商產品查詢">
+<meta name="description" content="每日叫貨進度、每日工作打勾確認、團隊行事曆、兩關簽核、廠商產品查詢與原物料分析">
 <meta name="theme-color" content="#2445a3">
 <meta name="application-name" content="採購看板">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -111,6 +111,11 @@
     </section>
 
     <section id="view-vendors" class="view" aria-label="廠商產品查詢" hidden>
+      <div class="seg vseg" role="group" aria-label="檢視">
+        <button type="button" data-vmode="products">產品比價</button>
+        <button type="button" data-vmode="materials">原物料分析</button>
+      </div>
+      <div id="prodPane" class="view">
       <div class="toolbar">
         <input type="search" id="pq" class="search wide" placeholder="輸入品名、規格或分類，查哪些廠商有供應" aria-label="搜尋產品">
         <select id="pvendor" aria-label="篩選廠商"></select>
@@ -128,6 +133,19 @@
           <h3>廠商名錄 <span id="vcount"></span></h3>
           <div id="vlist" class="vlist"></div>
         </aside>
+      </div>
+      </div>
+      <div id="matPane" class="view" hidden>
+        <div class="toolbar">
+          <input type="search" id="mq" class="search wide" placeholder="搜尋料號、品名、規格、供應廠商" aria-label="搜尋原料">
+          <span class="spacer"></span>
+          <button class="btn sm" type="button" data-mat-export title="把原物料分析匯出成 Excel 可開的 CSV">匯出 CSV</button>
+          <span id="matTools" class="row" hidden>
+            <button class="btn" type="button" data-add-mat>新增原料</button>
+            <button class="btn" type="button" data-import-mat>從 Excel 貼上原料清單</button>
+          </span>
+        </div>
+        <div id="matBody" class="view"></div>
       </div>
     </section>
 
