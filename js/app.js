@@ -470,7 +470,7 @@ function parseQuery(raw) {
 const hasAny = (hay, alts) => alts.some(a => hay.includes(a));
 // 相關度：每個關鍵字都要命中才算；命中位置 品名開頭 > 品名 > 分類 > 規格 > 廠商，用原字命中比同義詞高一點；品名越接近關鍵字越前面
 function scoreProduct(f, terms) {
-  let total = 0;
+  let total = 0, allInName = true;
   for (const { alts } of terms) {
     let best = 0;
     alts.forEach((a, i) => {
@@ -478,10 +478,12 @@ function scoreProduct(f, terms) {
       if (sc) best = Math.max(best, sc + (i === 0 ? 1 : 0));
     });
     if (!best) return 0;
+    if (best < 9) allInName = false;
     total += best;
   }
+  // 品名短加分只給「每個關鍵字都出現在品名裡」的（避免「乳酪絲」因為規格有「片」排在「乾酪片」前面）
   const qlen = terms.reduce((n, x) => n + x.t.length, 0);
-  return total + Math.min(qlen / Math.max(f.name.length, 1), 1) * 3;
+  return total + (allInName ? Math.min(qlen / Math.max(f.name.length, 1), 1) * 3 : 0);
 }
 // 上網找不是固定配合的廠商：在新分頁開搜尋引擎（查詢字只放在連結裡，看板不會自己送出去）
 function webSearchBox(q) {
