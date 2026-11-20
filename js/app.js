@@ -387,10 +387,7 @@ function renderVendors() {
   const opts = `<option value="">全部廠商</option>` + vs.map(v => `<option value="${esc(v.id)}">${esc(vLabel(v))}</option>`).join('');
   if (sel.dataset.h !== opts) { sel.innerHTML = opts; sel.dataset.h = opts; }
   sel.value = S.pvendor;
-  const cats = [...new Set(products.map(p => p.category).filter(Boolean))].sort(cmpZh);
-  if (S.pcat && !cats.includes(S.pcat)) S.pcat = '';
-  $('#cats').innerHTML = cats.length > 1 ? `<button type="button" class="chipbtn${!S.pcat ? ' on' : ''}" data-cat="">全部分類</button>` +
-    cats.map(c => `<button type="button" class="chipbtn${S.pcat === c ? ' on' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('') : '';
+  S.pcat = ''; // 分類按鈕列已拿掉（分類太多太雜），用搜尋代替
   const counts = {}; for (const p of products) counts[p.vendorId] = (counts[p.vendorId] || 0) + 1;
   const q = S.pq.toLowerCase();
   const vshow = q ? vs.filter(v => [v.code, v.name, v.category, v.contact, v.note].some(x => String(x || '').toLowerCase().includes(q))) : vs;
@@ -423,7 +420,7 @@ function renderVendors() {
   const keys = [...groups.keys()].sort(cmpZh);
   let body;
   if (!keys.length) {
-    body = S.pq ? `<div class="empty"><h3>找不到「${esc(S.pq)}」</h3><p>試試比較短的關鍵字，例如只打「螺絲」或「紙箱」，或換個分類、改成全部廠商。${vshow.length ? `廠商名錄裡有 ${vshow.length} 家符合，點廠商名稱可以看它的型錄連結。` : ''}</p></div>`
+    body = S.pq ? `<div class="empty"><h3>找不到「${esc(S.pq)}」</h3><p>試試比較短的關鍵字，例如只打「螺絲」或「紙箱」，或改成全部廠商。${vshow.length ? `廠商名錄裡有 ${vshow.length} 家符合，點廠商名稱可以看它的型錄連結。` : ''}</p></div>`
       : `<div class="empty"><h3>這個條件下還沒有產品</h3><p>${S.pvendor ? '這家廠商還沒登錄產品。' : ''}${can('vendor') ? '可以按「新增產品」加入。' : ''}</p>${can('vendor') ? '<div class="row"><button class="btn" type="button" data-add-product>新增產品</button></div>' : ''}</div>`;
   } else {
     const showActs = can('order') || can('vendor');
@@ -445,7 +442,7 @@ function renderVendors() {
           <td class="r num">${p.leadDays ? qtyf(p.leadDays) + ' <small>天</small>' : '—'}</td>
           ${showActs ? `<td class="r"><span class="acts">${can('order') ? `<button class="btn sm" type="button" data-order-product="${esc(p.id)}">叫貨</button>` : ''}${can('vendor') ? `<button class="icon-btn sm" type="button" data-edit-product="${esc(p.id)}" aria-label="編輯 ${esc(p.name)}">✎</button>` : ''}</span></td>` : ''}
         </tr>`).join('')}</tbody></table></div></div>`;
-    }).join('') + (limited ? `<div class="row"><button class="btn" type="button" data-pall>還有 ${keys.length - PGROUP_LIMIT} 種產品，全部顯示</button><span class="hint">也可以用上面的搜尋、分類或廠商縮小範圍。</span></div>` : '');
+    }).join('') + (limited ? `<div class="row"><button class="btn" type="button" data-pall>還有 ${keys.length - PGROUP_LIMIT} 種產品，全部顯示</button><span class="hint">也可以用上面的搜尋或廠商縮小範圍。</span></div>` : '');
   }
   out.innerHTML = head + body;
 }
