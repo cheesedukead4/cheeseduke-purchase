@@ -408,6 +408,15 @@ table.pt{width:100%;border-collapse:collapse;font-size:13px}
 .tag-lv{display:inline-block;font-size:11px;padding:0 6px;border-radius:4px;background:var(--accent-soft);color:var(--accent);line-height:18px;margin-right:6px;white-space:nowrap;font-family:var(--f-body)}
 .tag-retail{display:inline-block;margin-left:6px;font-size:11px;padding:0 6px;border-radius:4px;background:var(--gold-soft);color:var(--gold-t);font-family:var(--f-body);font-weight:500;white-space:nowrap}
 .pt a{color:var(--accent)}
+/* 潛在廠商標記、上網找其他廠商 */
+.tag-prospect{display:inline-block;margin-left:4px;font-size:11px;padding:0 6px;border-radius:4px;border:1px solid var(--accent);color:var(--accent);line-height:16px;white-space:nowrap;font-family:var(--f-body);font-weight:500}
+.websearch{margin-top:18px;padding:14px 16px;border:1px dashed var(--rule-2);border-radius:8px;background:var(--sheet-2);display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between}
+.websearch h4{margin:0 0 4px;font-size:15px;color:var(--accent)}
+.websearch p{margin:0;font-size:13px;color:var(--ink-2);max-width:46ch}
+.ws-links{display:flex;flex-wrap:wrap;gap:8px}
+.ws-links a{display:inline-flex;align-items:center;gap:4px;min-height:32px;padding:0 10px;border-radius:6px;border:1px solid var(--rule-2);background:var(--sheet);color:var(--ink);font-size:13px;font-weight:500;text-decoration:none;white-space:nowrap}
+.ws-links a::after{content:'↗';color:var(--ink-3)}
+.ws-links a:hover{border-color:var(--accent);color:var(--accent)}
 
 /* 原物料分析 */
 .vseg{align-self:flex-start}

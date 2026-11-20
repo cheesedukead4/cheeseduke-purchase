@@ -9,7 +9,7 @@
  *   progress: todo|ordered|partial|received|cancelled, approval: draft|l1|l2|approved|rejected,
  *   receivedQty, createdBy, createdAt, submittedAt, approvedAt, orderedAt, receivedAt, rejectNote, prevProgress,
  *   history: [{ id, act, by, role, at, note, to, add }], sample?, updatedAt }
- * 廠商：{ id, code(廠商代號), name, category, contact, phone, email, terms, leadDays, url(型錄／官網網址), note, sample? }
+ * 廠商：{ id, code(廠商代號), name, relation: 'partner'(固定配合，沒填也算)|'prospect'(潛在廠商), category, contact, phone, email, terms, leadDays, url(型錄／官網網址), note, sample? }
  * 產品：{ id, vendorId, name, spec, category, unit, price(0＝未報價), priceType: ''(採購報價)|'retail'(公開零售價／菜單價),
  *   moq, leadDays, level: ''(單一品項)|'cat'(品類)|'menu'(菜單品項), url(來源網址), note, sample? }
  * 內部原料 materials：{ id, code(料號), name, alias(其他名稱，逗號分隔), spec, category, unit, usage(每月用量), note, sample?, createdAt, updatedAt }
@@ -76,7 +76,7 @@ const D = {
   events: () => PBStore.list('events'),
 };
 let vById = new Map();
-const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, cmonth: today().slice(0, 7), cday: today(), corders: true, vmode: 'products', mq: '', mflag: '', pall: false, scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', detailId: null, busy: false };
+const S = { view: 'orders', day: today(), dday: today(), dmode: 'me', dperson: null, dpday: null, cmonth: today().slice(0, 7), cday: today(), corders: true, vmode: 'products', mq: '', mflag: '', pall: false, scope: 'day', q: '', flag: null, pq: '', pcat: '', pvendor: '', prel: '', psort: '', detailId: null, busy: false };
 const can = p => !!(window.PBAuth && PBAuth.can(p));
 const isAdmin = () => !!(window.PBAuth && PBAuth.isAdmin());
 const myName = () => (window.PBAuth && (PBAuth.name() || PBAuth.email())) || '';
@@ -373,6 +373,129 @@ const priceText = p => num(p.price) > 0 ? `${price(p.price)}${p.unit ? '／' + p
 const levelTag = p => p.level === 'cat' ? '<span class="tag-lv" title="廠商可供應的品類，不是單一品項">品類</span>' : p.level === 'menu' ? '<span class="tag-lv">菜單</span>' : '';
 const vendorSort = (a, b) => ((!a.code) - (!b.code)) || cmpZh(a.code || '', b.code || '') || cmpZh(a.name, b.name);
 const vLabel = v => (v.code ? v.code + ' ' : '') + v.name;
+
+/* ---------- 產品搜尋：多個關鍵字＋同義詞＋相關度排序 ---------- */
+// 廠商合作狀態：relation 'prospect'＝潛在廠商（還不是固定配合），其他（含沒填）＝固定配合
+const isProspect = v => !!v && v.relation === 'prospect';
+const relTag = v => isProspect(v) ? '<span class="tag-prospect" title="還不是固定配合的廠商">潛在</span>' : '';
+// 比對前統一寫法：全形轉半形（NFKC，也會把長得一樣的相容字轉成一般字）、英文小寫、常見異體字
+const FOLD = { '臺': '台', '鍊': '鏈', '裏': '裡', '麪': '麵', '着': '著' };
+const normQ = s => String(s ?? '').normalize('NFKC').toLowerCase().replace(/[臺鍊裏麪着]/g, c => FOLD[c]);
+// 同義詞：同一組裡任何一個詞都算符合
+const SYN_GROUPS = [
+  ['起司', '乳酪', '乾酪', '芝士', '奶酪', 'cheese'],
+  ['奶油乳酪', '奶油起司', '奶油乾酪', '奶油芝士', 'cream cheese', 'creamcheese'],
+  ['馬斯卡彭', '馬斯卡邦', '瑪斯卡邦', '馬斯卡朋', 'mascarpone'],
+  ['鮮奶油', '動物鮮奶油', '動物性鮮奶油', '淡奶油', 'whipping cream'],
+  ['奶油', '牛油', 'butter'],
+  ['酸奶油', '酸乳油', 'sour cream', 'creme fraiche'],
+  ['牛奶', '鮮奶', '鮮乳', '牛乳', 'milk'],
+  ['奶粉', '全脂奶粉', '脫脂奶粉', 'milk powder'],
+  ['煉乳', '煉奶', 'condensed milk'],
+  ['優格', '優酪', '酸奶', 'yogurt', 'yoghurt'],
+  ['雞蛋', '全蛋', '蛋液', 'egg'],
+  ['吉利丁', '明膠', 'gelatin', 'gelatine'],
+  ['洋菜', '寒天', '燕菜', 'agar'],
+  ['巧克力', '朱古力', 'chocolate', 'choc'],
+  ['可可', 'cocoa', 'cacao'],
+  ['香草', '香莢蘭', '香草莢', 'vanilla'],
+  ['杏仁', 'almond'],
+  ['榛果', '榛子', 'hazelnut'],
+  ['核桃', 'walnut'],
+  ['胡桃', '碧根果', 'pecan'],
+  ['開心果', 'pistachio'],
+  ['夏威夷豆', '夏威夷果', '澳洲堅果', 'macadamia'],
+  ['抹茶', '綠茶粉', 'matcha'],
+  ['草莓', 'strawberry'],
+  ['藍莓', 'blueberry'],
+  ['覆盆子', '覆盆莓', '樹莓', 'raspberry'],
+  ['芒果', 'mango'],
+  ['百香果', 'passion fruit', 'passionfruit'],
+  ['檸檬', 'lemon'],
+  ['柚子', 'yuzu'],
+  ['果泥', '果漿', 'puree', 'purée'],
+  ['蜂蜜', 'honey'],
+  ['咖啡', 'coffee'],
+  ['糖粉', '防潮糖粉', 'icing sugar', 'powdered sugar'],
+  ['海藻糖', 'trehalose'],
+  ['赤藻糖醇', 'erythritol'],
+  ['葡萄糖', 'dextrose', 'glucose'],
+  ['麵粉', 'flour'],
+  ['玉米粉', '玉米澱粉', 'cornstarch', 'corn starch'],
+  ['太白粉', '樹薯粉', '木薯粉', 'tapioca'],
+  ['泡打粉', '發粉', 'baking powder'],
+  ['小蘇打', '蘇打粉', '碳酸氫鈉', 'baking soda'],
+  ['塔塔粉', '酒石酸氫鉀', 'cream of tartar'],
+  ['色素', '著色劑', '色膏', '色粉', 'coloring', 'colour'],
+  ['烘焙紙', '烤盤紙', '烘培紙', 'baking paper', 'parchment'],
+  ['擠花袋', '裱花袋', 'piping bag'],
+  ['夾鏈袋', '由任袋', '封口袋', 'zipper bag'],
+  ['紙箱', '瓦楞', '外箱', 'carton'],
+  ['蛋糕盒', '西點盒', '點心盒', 'cake box'],
+  ['禮盒', 'gift box'],
+  ['膠帶', 'tape'],
+  ['乾燥劑', '除濕劑', '防潮劑', 'desiccant'],
+  ['脫氧劑', '去氧劑', '保鮮劑', 'oxygen absorber'],
+  ['保冷袋', '保冰袋', '保溫袋', '冰袋'],
+  ['鋁箔', '錫箔', 'foil'],
+  ['手套', 'glove'],
+  // 品牌中英文
+  ['法芙娜', 'valrhona'],
+  ['嘉麗寶', 'callebaut'],
+  ['可可百利', 'cacao barry', '可可巴芮'],
+  ['總統牌', 'president'],
+  ['艾許', 'echire'],
+  ['安佳', 'anchor'],
+  ['卡夫', 'kraft'],
+  ['明治', 'meiji'],
+  ['森永', 'morinaga'],
+  ['雪印', 'megmilk', 'snow brand'],
+].map(g => g.map(normQ));
+// 把搜尋字拆成關鍵字（空格、逗號、頓號分開；「cream cheese」這種多字同義詞先整段取出），每個關鍵字帶著它的同義詞
+function parseQuery(raw) {
+  let s = normQ(raw).trim();
+  if (!s) return [];
+  const terms = [];
+  for (const g of SYN_GROUPS) for (const a of g) if (a.includes(' ') && s.includes(a)) { terms.push(a); s = s.split(a).join(' '); }
+  for (const t of s.split(/[\s,，、;；]+/)) {
+    if (!t) continue;
+    // 關鍵字本身不是同義詞、但裡面含有同義詞（例如「起司片」含「起司」）→ 拆成「起司」＋「片」，乳酪片、切片乾酪也找得到
+    const inner = SYN_GROUPS.some(g => g.includes(t)) ? null
+      : SYN_GROUPS.flat().filter(a => a.length >= 2 && a !== t && t.includes(a)).sort((a, b) => b.length - a.length)[0];
+    if (inner) { terms.push(inner); for (const rest of t.split(inner)) if (rest) terms.push(rest); }
+    else terms.push(t);
+  }
+  return [...new Set(terms)].map(t => { const g = SYN_GROUPS.find(x => x.includes(t)); return { t, alts: g ? [t, ...g.filter(a => a !== t)] : [t] }; });
+}
+const hasAny = (hay, alts) => alts.some(a => hay.includes(a));
+// 相關度：每個關鍵字都要命中才算；命中位置 品名開頭 > 品名 > 分類 > 規格 > 廠商，用原字命中比同義詞高一點；品名越接近關鍵字越前面
+function scoreProduct(f, terms) {
+  let total = 0;
+  for (const { alts } of terms) {
+    let best = 0;
+    alts.forEach((a, i) => {
+      const sc = f.name.startsWith(a) ? 12 : f.name.includes(a) ? 9 : f.cat.includes(a) ? 5 : f.spec.includes(a) ? 3 : f.ven.includes(a) ? 2 : 0;
+      if (sc) best = Math.max(best, sc + (i === 0 ? 1 : 0));
+    });
+    if (!best) return 0;
+    total += best;
+  }
+  const qlen = terms.reduce((n, x) => n + x.t.length, 0);
+  return total + Math.min(qlen / Math.max(f.name.length, 1), 1) * 3;
+}
+// 上網找不是固定配合的廠商：在新分頁開搜尋引擎（查詢字只放在連結裡，看板不會自己送出去）
+function webSearchBox(q) {
+  const e = encodeURIComponent;
+  const links = [
+    ['Google 找供應商', `https://www.google.com/search?q=${e(q + ' 批發 供應商')}`],
+    ['Google 購物比價', `https://www.google.com/search?tbm=shop&q=${e(q)}`],
+    ['Google 地圖找附近', `https://www.google.com/maps/search/${e(q + ' 批發')}`],
+    ['蝦皮（零售價參考）', `https://shopee.tw/search?keyword=${e(q)}`],
+  ];
+  return `<section class="websearch" aria-label="上網找其他廠商">
+    <div class="ws-text"><h4>找不是固定配合的廠商</h4><p>用搜尋引擎找「${esc(q)}」，會開新分頁。找到合適的廠商，可以加入成潛在廠商，下次直接在這裡搜得到。</p></div>
+    <div class="ws-links">${links.map(([l, u]) => extLink(u, l)).join('')}${can('vendor') ? '<button class="btn sm primary" type="button" data-add-prospect>＋ 加入潛在廠商</button>' : ''}</div></section>`;
+}
 const PGROUP_LIMIT = 60; // 沒有搜尋或篩選時，先顯示前 60 種產品，避免一次畫太多
 
 function renderVendors() {
@@ -389,11 +512,24 @@ function renderVendors() {
   sel.value = S.pvendor;
   S.pcat = ''; // 分類按鈕列已拿掉（分類太多太雜），用搜尋代替
   const counts = {}; for (const p of products) counts[p.vendorId] = (counts[p.vendorId] || 0) + 1;
-  const q = S.pq.toLowerCase();
-  const vshow = q ? vs.filter(v => [v.code, v.name, v.category, v.contact, v.note].some(x => String(x || '').toLowerCase().includes(q))) : vs;
-  $('#vcount').textContent = vs.length ? (q ? `${vshow.length} / ${vs.length} 家` : vs.length + ' 家') : '';
+  $('#prel').value = S.prel; $('#psort').value = S.psort;
+  const terms = parseQuery(S.pq), q = terms.length > 0;
+  const relOk = v => !S.prel || (S.prel === 'prospect') === isProspect(v);
+  // 先算符合的產品（廠商名錄也要用：有符合產品的廠商會一起列出）
+  let list = products.filter(p => relOk(vById.get(p.vendorId)));
+  const score = new Map();
+  if (q) list = list.filter(p => {
+    const v = vById.get(p.vendorId) || {};
+    const sc = scoreProduct({ name: normQ(p.name), cat: normQ(p.category), spec: normQ(p.spec), ven: normQ((v.code || '') + ' ' + (v.name || '')) }, terms);
+    if (sc) score.set(p.id, sc);
+    return sc > 0;
+  });
+  const hitByV = {}; if (q) for (const p of list) hitByV[p.vendorId] = (hitByV[p.vendorId] || 0) + 1;
+  const vshow = vs.filter(relOk).filter(v => !q || hitByV[v.id] || terms.every(x => hasAny(normQ([v.code, v.name, v.category, v.contact, v.note].join(' ')), x.alts)));
+  if (q) vshow.sort((a, b) => (hitByV[b.id] || 0) - (hitByV[a.id] || 0));
+  $('#vcount').textContent = vs.length ? (q || S.prel ? `${vshow.length} / ${vs.length} 家` : vs.length + ' 家') : '';
   $('#vlist').innerHTML = vshow.length ? vshow.map(v => `<button type="button" class="vitem${S.pvendor === v.id ? ' on' : ''}" data-vendor="${esc(v.id)}">
-      <span class="vname">${v.code ? `<span class="vcode">${esc(v.code)}</span>` : ''}${esc(v.name)} ${sampleTag(v)}</span><span class="vcount">${counts[v.id] || 0} 項</span>
+      <span class="vname">${v.code ? `<span class="vcode">${esc(v.code)}</span>` : ''}${esc(v.name)} ${relTag(v)}${sampleTag(v)}</span><span class="vcount">${q ? `${hitByV[v.id] || 0} 項符合` : `${counts[v.id] || 0} 項`}</span>
       <span class="vmeta">${esc([v.category, v.contact].filter(Boolean).join(' · ') || '—')}</span></button>`).join('')
     : `<p class="col-empty">${vs.length ? '沒有符合的廠商。' : '還沒有廠商。'}</p>`;
   const out = $('#presults');
@@ -407,26 +543,34 @@ function renderVendors() {
   if (S.pvendor) {
     const v = vById.get(S.pvendor);
     const f = (k, val) => val ? `<div><dt>${k}</dt><dd>${esc(val)}</dd></div>` : '';
-    head = `<div class="vhead"><div class="vhead-top"><h3>${v.code ? `<span class="vcode">${esc(v.code)}</span>` : ''}${esc(v.name)}</h3>${sampleTag(v)}
+    head = `<div class="vhead"><div class="vhead-top"><h3>${v.code ? `<span class="vcode">${esc(v.code)}</span>` : ''}${esc(v.name)}</h3>${relTag(v)}${sampleTag(v)}
       ${can('vendor') ? `<button class="btn sm" type="button" data-edit-vendor="${esc(v.id)}">編輯廠商</button>` : ''}<button class="btn sm ghost" type="button" data-vendor="">看全部廠商</button></div>
-      <dl>${f('主要品類', v.category)}${f('聯絡人', v.contact)}${f('電話', v.phone)}${f('Email', v.email)}${f('付款條件', v.terms)}${v.leadDays ? f('平均交期', v.leadDays + ' 天') : ''}${okUrl(v.url) ? `<div><dt>型錄／官網</dt><dd>${extLink(v.url, '開啟連結')}</dd></div>` : ''}${f('備註', v.note)}</dl></div>`;
+      <dl>${f('合作狀態', isProspect(v) ? '潛在廠商（還不是固定配合）' : '固定配合')}${f('主要品類', v.category)}${f('聯絡人', v.contact)}${f('電話', v.phone)}${f('Email', v.email)}${f('付款條件', v.terms)}${v.leadDays ? f('平均交期', v.leadDays + ' 天') : ''}${okUrl(v.url) ? `<div><dt>型錄／官網</dt><dd>${extLink(v.url, '開啟連結')}</dd></div>` : ''}${f('備註', v.note)}</dl></div>`;
   }
-  let list = products;
   if (S.pvendor) list = list.filter(p => p.vendorId === S.pvendor);
   if (S.pcat) list = list.filter(p => p.category === S.pcat);
-  if (q) list = list.filter(p => [p.name, p.spec, p.category, vName(p.vendorId), (vById.get(p.vendorId) || {}).code].some(x => String(x || '').toLowerCase().includes(q)));
   const groups = new Map();
   for (const p of list) { const k = (p.name || '').trim(); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(p); }
-  const keys = [...groups.keys()].sort(cmpZh);
+  const keys = [...groups.keys()];
+  const sortMode = S.psort || (q ? 'rel' : 'name');
+  if (sortMode === 'price') {
+    const best = new Map(keys.map(k => [k, [...groups.get(k)].sort(offerSort)[0]]));
+    keys.sort((a, b) => offerSort(best.get(a), best.get(b)) || cmpZh(a, b));
+  } else if (sortMode === 'rel') {
+    const gs = new Map(keys.map(k => [k, Math.max(...groups.get(k).map(p => score.get(p.id) || 0))]));
+    keys.sort((a, b) => (gs.get(b) - gs.get(a)) || cmpZh(a, b));
+  } else keys.sort(cmpZh);
+  const relNote = S.prel ? `目前只看${S.prel === 'prospect' ? '潛在廠商' : '固定配合的廠商'}，可以改回「全部」。` : '';
   let body;
   if (!keys.length) {
-    body = S.pq ? `<div class="empty"><h3>找不到「${esc(S.pq)}」</h3><p>試試比較短的關鍵字，例如只打「螺絲」或「紙箱」，或改成全部廠商。${vshow.length ? `廠商名錄裡有 ${vshow.length} 家符合，點廠商名稱可以看它的型錄連結。` : ''}</p></div>`
+    body = q ? `<div class="empty"><h3>看板裡找不到「${esc(S.pq)}」</h3><p>${relNote}試試比較短的關鍵字，或少打幾個字。${vshow.length ? `廠商名錄裡有 ${vshow.length} 家符合，點廠商名稱可以看它的型錄連結。` : ''}</p></div>${webSearchBox(S.pq)}`
       : `<div class="empty"><h3>這個條件下還沒有產品</h3><p>${S.pvendor ? '這家廠商還沒登錄產品。' : ''}${can('vendor') ? '可以按「新增產品」加入。' : ''}</p>${can('vendor') ? '<div class="row"><button class="btn" type="button" data-add-product>新增產品</button></div>' : ''}</div>`;
   } else {
     const showActs = can('order') || can('vendor');
-    const limited = !q && !S.pvendor && !S.pcat && !S.pall && keys.length > PGROUP_LIMIT;
+    const limited = !S.pvendor && !S.pcat && !S.pall && keys.length > PGROUP_LIMIT;
     const shown = limited ? keys.slice(0, PGROUP_LIMIT) : keys;
-    body = `<p class="pcount">${keys.length} 種產品 · ${list.length} 筆${S.pq ? `（搜尋「${esc(S.pq)}」）` : ''}</p>` + shown.map(k => {
+    const syn = q ? terms.filter(x => x.alts.length > 1).map(x => x.alts.slice(1, 4).join('、')).join('；') : '';
+    body = `<p class="pcount">${keys.length} 種產品 · ${list.length} 筆${q ? `（搜尋「${esc(S.pq)}」${syn ? `，也找了同義詞：${esc(syn)}` : ''}${sortMode === 'rel' ? '，最相關的在前面' : ''}）` : ''}${relNote && q ? ' ' + relNote : ''}${q ? ' <button type="button" class="link" data-ws-jump>上網找其他廠商 ↓</button>' : ''}</p>` + shown.map(k => {
       const arr = groups.get(k).sort(offerSort);
       const vcount = new Set(arr.map(p => p.vendorId)).size;
       const quotes = arr.filter(isQuote);
@@ -435,14 +579,14 @@ function renderVendors() {
       return `<div class="pgroup"><div class="pg-head"><h4>${esc(k)}</h4><span class="pg-sum">${vcount} 家供應${sum}</span></div>
         <div class="tscroll"><table class="pt"><thead><tr><th>廠商</th><th>規格</th><th class="r">單價</th><th class="r">最小訂量</th><th class="r">交期</th>${showActs ? '<th class="r"><span class="muted">操作</span></th>' : ''}</tr></thead><tbody>
         ${arr.map((p, i) => `<tr>
-          <td><button type="button" class="link" data-vendor="${esc(p.vendorId)}">${esc(vName(p.vendorId))}</button> ${sampleTag(p)}</td>
+          <td><button type="button" class="link" data-vendor="${esc(p.vendorId)}">${esc(vName(p.vendorId))}</button> ${relTag(vById.get(p.vendorId))}${sampleTag(p)}</td>
           <td${p.note ? ` title="${esc(p.note)}"` : ''}>${levelTag(p)}${[p.spec ? esc(p.spec) : '', p.category ? `<span class="muted">${esc(p.category)}</span>` : '', okUrl(p.url) ? `<span class="muted">${extLink(p.url, '來源')}</span>` : ''].filter(Boolean).join(' <span class="muted">·</span> ') || (p.level ? '' : '—')}</td>
           <td class="r num">${priceCell(p)}${i === 0 && isQuote(p) && quotes.length > 1 && num(p.price) < num(quotes[quotes.length - 1].price) ? '<span class="best">最低</span>' : ''}</td>
           <td class="r num">${p.moq ? qtyf(p.moq) + ' <small>' + esc(p.unit || '') + '</small>' : '—'}</td>
           <td class="r num">${p.leadDays ? qtyf(p.leadDays) + ' <small>天</small>' : '—'}</td>
           ${showActs ? `<td class="r"><span class="acts">${can('order') ? `<button class="btn sm" type="button" data-order-product="${esc(p.id)}">叫貨</button>` : ''}${can('vendor') ? `<button class="icon-btn sm" type="button" data-edit-product="${esc(p.id)}" aria-label="編輯 ${esc(p.name)}">✎</button>` : ''}</span></td>` : ''}
         </tr>`).join('')}</tbody></table></div></div>`;
-    }).join('') + (limited ? `<div class="row"><button class="btn" type="button" data-pall>還有 ${keys.length - PGROUP_LIMIT} 種產品，全部顯示</button><span class="hint">也可以用上面的搜尋或廠商縮小範圍。</span></div>` : '');
+    }).join('') + (limited ? `<div class="row"><button class="btn" type="button" data-pall>還有 ${keys.length - PGROUP_LIMIT} 種產品，全部顯示</button><span class="hint">${q ? '後面的比較不相關；多打一個關鍵字可以縮小範圍。' : '也可以用上面的搜尋或廠商縮小範圍。'}</span></div>` : '') + (q ? webSearchBox(S.pq) : '');
   }
   out.innerHTML = head + body;
 }
@@ -1665,6 +1809,7 @@ function openVendorForm(v) {
     <div class="dlg-body form-grid">
       <label class="f" for="v-code">廠商代號<input id="v-code" maxlength="20" value="${esc(v.code || '')}" placeholder="例如：A001"></label>
       <label class="f" for="v-name"><span class="req">廠商名稱</span><input id="v-name" value="${esc(v.name || '')}" autofocus></label>
+      <label class="f" for="v-rel">合作狀態<select id="v-rel"><option value="partner">固定配合</option><option value="prospect"${isProspect(v) ? ' selected' : ''}>潛在廠商（還沒固定配合）</option></select></label>
       <label class="f" for="v-cat">主要品類<input id="v-cat" value="${esc(v.category || '')}" placeholder="五金、包材、電子零件"></label>
       <label class="f" for="v-contact">聯絡人<input id="v-contact" value="${esc(v.contact || '')}"></label>
       <label class="f" for="v-phone">電話<input id="v-phone" type="tel" value="${esc(v.phone || '')}"></label>
@@ -1689,7 +1834,7 @@ function openVendorForm(v) {
       if (D.vendors().some(x => x.id !== v.id && x.name.trim() === name && (!code || !x.code || x.code === code))) return fail('已經有同名的廠商。');
       if (code && D.vendors().some(x => x.id !== v.id && normKey(x.code) === normKey(code))) return fail('已經有相同代號的廠商。', 'v-code');
       if (url && !okUrl(url)) return fail('網址要以 http:// 或 https:// 開頭。', 'v-url');
-      const data = { code, name, category: g('v-cat'), contact: g('v-contact'), phone: g('v-phone'), email: g('v-email'), terms: g('v-terms'), leadDays: num(g('v-lead')), url, note: g('v-note'), updatedAt: nowIso() };
+      const data = { code, name, relation: g('v-rel'), category: g('v-cat'), contact: g('v-contact'), phone: g('v-phone'), email: g('v-email'), terms: g('v-terms'), leadDays: num(g('v-lead')), url, note: g('v-note'), updatedAt: nowIso() };
       closeDialog();
       if (isEdit) upd('vendors', v.id, data, `已更新 ${name}`);
       else { const id = rid(); S.pvendor = id; PBStore.save('vendors', { id, ...data, createdAt: nowIso() }); toast(`已新增 ${name}`); }
@@ -1766,7 +1911,10 @@ const IMP_COLS = {
   phone: ['電話', '聯絡電話'],
   email: ['Email', 'E-mail', '電子郵件'],
   terms: ['付款條件'],
+  relation: ['合作狀態', '配合狀態', '合作關係', '廠商類型'],
 };
+// 「合作狀態」欄：潛在／非配合／尚未 → 潛在廠商；固定／配合／合作 → 固定配合；空白就不改
+const relOf = s => /潛在|非配合|未配合|尚未/.test(s) ? 'prospect' : /固定|配合|合作/.test(s) ? 'partner' : '';
 const normH = s => String(s ?? '').replace(/[\s　]/g, '').toLowerCase();
 const IMP_INDEX = new Map(Object.entries(IMP_COLS).flatMap(([k, names]) => names.map(n => [normH(n), k])));
 // 解析 Excel 複製出來的表格（Tab 分隔；儲存格內有換行時 Excel 會加引號）
@@ -1804,7 +1952,7 @@ function parseImport(text) {
       const lv = get(r, 'level');
       const level = /品類/.test(lv) ? 'cat' : /菜單/.test(lv) ? 'menu' : '';
       return {
-        code: get(r, 'code'), vendor: get(r, 'vendor'), name: get(r, 'name'), spec: get(r, 'spec'), category: get(r, 'category'), unit: get(r, 'unit'),
+        code: get(r, 'code'), vendor: get(r, 'vendor'), relation: relOf(get(r, 'relation')), name: get(r, 'name'), spec: get(r, 'spec'), category: get(r, 'category'), unit: get(r, 'unit'),
         price: num(get(r, 'price')), moq: num(get(r, 'moq')), leadDays: num(get(r, 'leadDays')), url: get(r, 'url'),
         level, priceType: /實際商品|菜單|零售/.test(lv) ? 'retail' : '', note: [level === 'cat' ? '' : lv, get(r, 'priceText'), get(r, 'note')].filter(Boolean).join('｜'),
       };
@@ -1813,7 +1961,7 @@ function parseImport(text) {
   }
   const skipped = [], rows = [];
   for (const r of body) {
-    const x = { code: get(r, 'code'), name: get(r, 'vendor'), category: get(r, 'category'), url: get(r, 'url'), contact: get(r, 'contact'), phone: get(r, 'phone'), email: get(r, 'email'), terms: get(r, 'terms'),
+    const x = { code: get(r, 'code'), name: get(r, 'vendor'), relation: relOf(get(r, 'relation')), category: get(r, 'category'), url: get(r, 'url'), contact: get(r, 'contact'), phone: get(r, 'phone'), email: get(r, 'email'), terms: get(r, 'terms'),
       note: [get(r, 'status'), get(r, 'srcType'), get(r, 'note')].filter(Boolean).join('｜') };
     if (!x.name && !x.code) continue;
     if (/非廠商/.test(get(r, 'status'))) { skipped.push(x.name || x.code); continue; }
@@ -1889,12 +2037,12 @@ function runImport(parsed) {
   let addedP = 0, updatedP = 0;
   const pOut = new Map();
   if (mode === 'vendors') {
-    for (const r of rows) upsertV(r.code, r.name, { name: r.name, category: r.category, url: okUrl(r.url) ? r.url : '', note: r.note, contact: r.contact, phone: r.phone, email: r.email, terms: r.terms });
+    for (const r of rows) upsertV(r.code, r.name, { name: r.name, relation: r.relation, category: r.category, url: okUrl(r.url) ? r.url : '', note: r.note, contact: r.contact, phone: r.phone, email: r.email, terms: r.terms });
   } else {
     const pkey = (vid, name, spec, cat) => vid + '|' + name.trim() + '|' + (spec || '').trim() + (parsed.byCat ? '|' + (cat || '').trim() : '');
     const existing = new Map(D.products().map(p => [pkey(p.vendorId, p.name || '', p.spec, p.category), p]));
     for (const r of rows) {
-      const v = vm.find(r.code, r.vendor) || upsertV(r.code, r.vendor, { name: r.vendor, category: r.category, leadDays: r.leadDays });
+      const v = vm.find(r.code, r.vendor) || upsertV(r.code, r.vendor, { name: r.vendor, relation: r.relation, category: r.category, leadDays: r.leadDays });
       const key = pkey(v.id, r.name, r.spec, r.category);
       const body = { vendorId: v.id, name: r.name, spec: r.spec, category: r.category, unit: r.unit, price: r.price, moq: r.moq, leadDays: r.leadDays, updatedAt: T };
       if (header) Object.assign(body, { level: r.level || '', priceType: r.priceType || '', url: okUrl(r.url) ? r.url : '', ...(r.note ? { note: r.note } : {}) });
@@ -2093,6 +2241,8 @@ document.addEventListener('click', e => {
   if (d.editVendor) return openVendorForm(vById.get(d.editVendor));
   if ('newOrder' in d) return openOrderForm();
   if ('addVendor' in d) return openVendorForm();
+  if ('addProspect' in d) return openVendorForm({ relation: 'prospect', category: S.pq });
+  if ('wsJump' in d) { const w = $('.websearch'); if (w) { w.scrollIntoView({ behavior: 'smooth', block: 'center' }); const a = w.querySelector('a'); if (a) a.focus({ preventScroll: true }); } return; }
   if ('addProduct' in d) return openProductForm();
   if ('import' in d) return openImport();
   if ('sample' in d) return loadSample();
@@ -2150,7 +2300,9 @@ S.corders = LS.get('pb_cal_orders', true) !== false;
 $('#dailyBody').addEventListener('submit', onDailySubmit);
 dlg.addEventListener('change', onDialogChange);
 $('#oq').addEventListener('input', e => { S.q = e.target.value.trim(); renderOrders(); });
-$('#pq').addEventListener('input', e => { S.pq = e.target.value.trim(); renderVendors(); });
+$('#pq').addEventListener('input', e => { S.pq = e.target.value.trim(); S.pall = false; renderVendors(); });
+$('#prel').addEventListener('change', e => { S.prel = e.target.value; S.pall = false; renderVendors(); });
+$('#psort').addEventListener('change', e => { S.psort = e.target.value; renderVendors(); });
 $('#mq').addEventListener('input', e => { S.mq = e.target.value.trim(); renderVendors(); });
 $('#pvendor').addEventListener('change', e => { S.pvendor = e.target.value; renderVendors(); });
 window.addEventListener('hashchange', route);
